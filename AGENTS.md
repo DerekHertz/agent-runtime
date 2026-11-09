@@ -36,6 +36,8 @@ Before implementation or review, read `.agents/memory/MEMORY.md` and relevant to
 
 ## Claude implementation and Codex review
 
+For every PR, follow pstack's `poteto-mode` Opening a PR playbook. Apply `technical-writing` and then `unslop` to the title, description, and commit body. Use a Conventional Commit title and a one-minute description with `## Why`, `## What changed`, `## Scope`, optional `## Tradeoffs`, `## Blast Radius`, and `## Verification`, in that order. Keep the body under about 40 lines; link detailed evidence instead of pasting execution history.
+
 1. Claude implements the requested change and runs relevant project checks.
 2. Codex independently reviews the entire task diff and surrounding code without editing files. Findings must include location, trigger, impact, and evidence, checking the spec, ADRs, and shared lessons.
 3. Claude verifies findings, repairs confirmed issues, explains rejected findings with evidence, and reruns relevant checks.
