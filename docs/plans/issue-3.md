@@ -4,6 +4,10 @@ Issue #3 extends tracing from PreToolUse alone (issue #2, PR #14) to every hook 
 
 The work ships as five small PRs. Each one leaves the system usable and tested at its own level. A PR targets the PR it actually depends on; work that depends on nothing pending targets `main`. Issue #3 is complete only after PR 5's acceptance checks pass.
 
+## Merge hold
+
+No issue #3 PR merges, and the issue stays open, until Derek has reviewed every PR's report together. Each PR records its walkthrough in `docs/reviews/`. See [PR #15's review](../reviews/pr-15.md).
+
 ## PRs
 
 1. **Blob store API** (this PR). `trace_store::BlobStore` stores exact bytes under their full 32-byte blake3 hash in `runs/<run-id>/blobs/` and returns them only if they still hash to their name. `BlobStore::open` requires an existing run directory and refuses a missing one; creating the run directory and making it durable stays with the caller, which PR 2 adds. Nothing calls the store yet. Tests run on a real file system: round trip, refusal of a missing run directory, official blake3 vectors, deduplication, distinct content, missing and corrupt reads, concurrent identical writers with a racing reader, and removal of the temporary file after a failed write.

@@ -40,6 +40,10 @@ For every PR, follow pstack's `poteto-mode` Opening a PR playbook. Apply `techni
 
 Keep each PR small enough to review in one sitting. Stack PRs only when a later one truly depends on an earlier one; otherwise open them independently against `main`.
 
+Give Derek a review walkthrough for every PR before asking for his review. Explain the core modules, runtime flow, important tradeoffs, and testing results; skip boilerplate and line-by-line narration. Identify the PR and reviewed head, and update the walkthrough when later changes materially affect it.
+
+After Derek comments, record the walkthrough and review outcome in `docs/reviews/pr-<number>.md`, or append to an existing record for that PR. Include the reviewed head, date, his feedback, decisions, resulting changes, verification results, and unresolved points. Preserve earlier review rounds. Distinguish Derek's feedback from agent findings; do not mark human review complete before he has commented.
+
 1. Claude implements the requested change and runs relevant project checks.
 2. Codex independently reviews the entire task diff and surrounding code without editing files. Findings must include location, trigger, impact, and evidence, checking the spec, ADRs, and shared lessons.
 3. Claude verifies findings, repairs confirmed issues, explains rejected findings with evidence, and reruns relevant checks.
