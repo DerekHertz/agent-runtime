@@ -5,7 +5,7 @@ All agents in a run edit one shared working tree. The coordinator only admits or
 ## Considered options
 
 - **Private tree per agent, published at release.** This gives true release consistency. Rejected for v1 because of its size and because it blurs the comparison with the worktree baseline.
-- **Shared tree, with Reads of a file someone else owns redirected to its last released snapshot.** Rejected because Bash reads and builds would still see in-progress state, so it buys partial isolation at real complexity.
+- **Shared tree, with Reads of a file someone else owns redirected to its last released snapshot.** Rejected because Bash reads and builds would still see in-progress state, so it buys partial isolation at real complexity. *(Later adopted for the `Read` tool only; see the amendment below.)*
 
 ## Consequences
 

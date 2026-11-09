@@ -119,7 +119,7 @@ Until M3, Deny or Defer is a single setting for the whole run, with Deny as the 
 
 A failing release command keeps the lease. Release with changes invalidates every other agent's Shared copy of that file. The next read by any of them is served fresh and stamped with the writer's clock, which is what makes the causal trace meaningful.
 
-**Reads of a leased file.** When an agent calls `Read` on a file another agent holds the lease on, the shim rewrites the call with `updatedInput` to point at the coordinator's snapshot of the file's last released version. The reader never sees half-done work and never waits. If M0 shows that `updatedInput` can't redirect a Read, the fallback is the run's Deny-or-Defer setting.
+**Reads of a leased file.** When an agent calls `Read` on a file another agent holds the lease on, the shim rewrites the call with `updatedInput` to point at the coordinator's snapshot of the file's last released version. The reader never sees half-done work and never waits. M0 confirmed that `updatedInput` redirects a Read invisibly to the model.
 
 **Consistency model.** v1 guarantees one writer per file at a time, with invalidation at release. It does *not* provide release consistency: all agents share one tree, so builds and tests by other agents see an owner's in-progress edits as soon as they are on disk. The `Read` tool does not, because it is served the last released version. That cost is measured in the trace, for example builds failing on another agent's half-finished file. If it turns out to be large, private trees per agent with publication at release are the next step. See [ADR 0001](adr/0001-shared-tree-single-writer-leases.md).
 
@@ -288,7 +288,7 @@ An M0 spike followed by six milestones, each ending in something a coding agent 
    5. whether the cap of 8 consecutive Stop-hook continuations holds;
    6. how the model behaves after a Deny.
 
-   *Done when:* `docs/research/m0-hook-probe.md` answers all six with logs.
+   *Done when:* `docs/research/m0-hook-probe.md` answers all six with logs. **Done 2026-11-08.**
 1. **M1: Hook shim and trace (no coherence yet).** A Rust shim binary registered as Claude Code hooks, plus a minimal coordinator that allows every call, holds the clocks and is the only process that writes the SQLite trace. Shims keep no state. Two agents run on the toy crate (`bench/toy/`: one source file of about 3 functions plus a test, copied to a temp directory per run), prompted so that both must edit the same function. The store can answer `happens_before` for any pair.
    *Done when:* a concurrent-write pair is detected in a deliberately conflicting run.
 2. **M2: File leases.** Coordinator with Acquire/Release/Deny/Defer and invalidation.
@@ -308,9 +308,9 @@ Milestones 1 through 4 are the resume deliverable on their own. M5 and M6 are wh
 
 ## 10. Open questions and risks
 
-- [ ] **Hook latency budget.** Claude Code runs hooks synchronously; if a Defer blocks for 60 s, does the session time out or degrade? Measured in M0. The hook timeout is set to the Defer timeout plus 30 s (section 3).
+- [x] **Hook latency budget.** Resolved by M0: a 60 s block is safe, and a hook timeout fails open (docs/research/m0-hook-probe.md). Original question: Claude Code runs hooks synchronously; if a Defer blocks for 60 s, does the session time out or degrade? Measured in M0. The hook timeout is set to the Defer timeout plus 30 s (section 3).
 - [ ] **Bash path extraction.** The conservative "touch everything" fallback may make Bash-heavy agents hold global leases constantly. Need trace data from M2 to decide how much static analysis is worth.
-- [ ] **Agent behavior on Deny.** Does the model retry the same edit, pick another task, or stall? First look in M0. If it stalls, the orchestrator needs a nudge mechanism, which is scope creep worth resisting.
+- [ ] **Agent behavior on Deny.** Does the model retry the same edit, pick another task, or stall? M0: with nothing else to do it retries once, then stops and reports; it never works around the lease. Switching to other work is still untested. If it stalls, the orchestrator needs a nudge mechanism, which is scope creep worth resisting.
 - [x] **Clock identity across sessions.** Resolved: clocks are keyed by a run-scoped slot that the launcher assigns through environment variables. The coordinator maps `session_id` to slot (section 3).
 - [ ] **Own-loop adapter priority.** It is cleaner but delays dogfooding. Current call: hooks first, own loop only if hooks prove too constraining by M2.
 - [ ] **Benchmark repository.** Needs enough parallelizable work for 10 agents and a fast test suite. The city sim itself is the candidate once M5 exists; before that, a mid-size open-source Rust crate.
