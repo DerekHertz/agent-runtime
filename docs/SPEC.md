@@ -156,6 +156,8 @@ This is what ties coherence and causality together: reading a file that agent A 
 | payload_hash | bytes  | hash of the tool input or output; the full content lives in a blob store keyed by hash |
 | wall_time    | i64    | for display only, never for ordering                                                   |
 
+**Layout.** Each run has its own directory, `runs/<run-id>/`, containing `trace.db` (SQLite, append-only, written only by the coordinator) and `blobs/` (content-addressed by blake3). Queries do not run in SQL. A run is loaded into memory (`Run::load(dir)`) and queried with pure methods. A later live-tail adapter will serve the viewer.
+
 **Queries the store must answer.**
 
 - `happens_before(e1, e2)`: VC(e1) < VC(e2) element-wise with at least one strict.
@@ -215,8 +217,8 @@ message BeforeToolRequest {
   string agent_id = 1;
   bytes vclock = 2;
   string tool = 3;           // Edit, Write, Bash, ...
-  repeated string paths = 4; // files the tool will touch, extracted by the shim
-  string intent = 5;         // optional, the agent's one-line reason
+  string tool_input_json = 4; // raw hook tool_input; the coordinator core classifies it (paths, Bash class)
+  string intent = 5;          // Bash `description` when present, else empty; agents are never prompted for it
 }
 
 message Admission {
@@ -232,7 +234,7 @@ message Admission {
 
 **Remote tool invocation.** Tools that agents call but that live outside the agent process (the test runner, a shared build cache, the city sim's headless shards later) are exposed as gRPC services with generated stubs. The shim rewrites a local tool call into a remote call transparently. This is the RMI-shaped part: a stub, a skeleton, serialization, and a registry, with the registry being the coordinator. It is also the natural seam if the runtime ever spans machines.
 
-**Path extraction.** For Edit, Write and NotebookEdit the paths are explicit in the tool input. Bash commands fall into three classes, with the lists set per run in config:
+**Path extraction.** The shim forwards the raw tool input. All classification happens in the coordinator core, driven by run config, so the trace keeps the raw input and old runs can be re-classified offline. For Edit, Write and NotebookEdit the paths are explicit in the tool input. Bash commands fall into three classes, with the lists set per run in config:
 
 - **Read-only** (e.g. `cargo test/build/check/clippy`, `git status/diff/log`, `ls`, `cat`, `grep`, `rg`, `find`): no lease needed. Build and test commands count as whole-tree reads for clocks (section 5).
 - **Writes to known paths** (e.g. `mv`, `cp`, `rm`, `sed -i`, `>` redirects to a file): a lease on each path.
@@ -282,7 +284,7 @@ An M0 spike followed by six milestones, each ending in something a coding agent 
    6. how the model behaves after a Deny.
 
    *Done when:* `docs/research/m0-hook-probe.md` answers all six with logs.
-1. **M1: Hook shim and trace (no coherence yet).** A Rust shim binary registered as Claude Code hooks, plus a minimal coordinator that allows every call, holds the clocks and is the only process that writes the SQLite trace. Shims keep no state. Two agents run on a toy repo; the store can answer `happens_before` for any pair.
+1. **M1: Hook shim and trace (no coherence yet).** A Rust shim binary registered as Claude Code hooks, plus a minimal coordinator that allows every call, holds the clocks and is the only process that writes the SQLite trace. Shims keep no state. Two agents run on the toy crate (`bench/toy/`: one source file of about 3 functions plus a test, copied to a temp directory per run), prompted so that both must edit the same function. The store can answer `happens_before` for any pair.
    *Done when:* a concurrent-write pair is detected in a deliberately conflicting run.
 2. **M2: File leases.** Coordinator with Acquire/Release/Deny/Defer and invalidation.
    *Done when:* the same conflicting run from M1 produces zero concurrent writes to one path, and the trace shows the Deny.
