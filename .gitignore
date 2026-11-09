@@ -4,3 +4,8 @@
 *.db-shm
 .DS_Store
 bench/m0/runs/
+
+# Local agent settings and transient review output
+.claude/settings.local.json
+.claude/reviews/
+.claude/worktrees/

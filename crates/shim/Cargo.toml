@@ -1,0 +1,33 @@
+[package]
+name = "shim"
+description = "Claude Code hook program: asks the coordinator before a tool call (SPEC section 3)"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "art-shim"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+runtime-proto.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+# raw_value: forward the hook's tool_input byte-for-byte instead of re-ordering its keys.
+serde_json = { workspace = true, features = ["raw_value"] }
+tonic.workspace = true
+tokio.workspace = true
+tower.workspace = true
+hyper-util.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio-stream.workspace = true
+# End-to-end test only (tests/e2e.rs): the real coordinator and trace behind the shim binary.
+clock.workspace = true
+coordinator.workspace = true
+trace-store.workspace = true

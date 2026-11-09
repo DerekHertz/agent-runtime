@@ -1,0 +1,15 @@
+[package]
+name = "clock"
+description = "Vector clocks: one counter per slot in a run (SPEC section 5)"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+proptest.workspace = true

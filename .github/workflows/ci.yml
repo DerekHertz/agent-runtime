@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Line limit
+        run: scripts/check-file-lines.sh
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # bench/toy is excluded on purpose: it is a fixture outside the workspace, and its
+      # mean_works test fails by design (the seeded bug agents fix in M1/M2 runs).
+      - name: Test
+        run: cargo test --workspace --locked
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Keep the toolchain in step with rust-version in Cargo.toml. 1.89 is the highest
+      # rust-version among the locked dependencies (rusqlite 0.41.1) and the version that
+      # stabilised File::try_lock.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.89"
+      - name: Check at the minimum supported Rust version
+        run: cargo check --workspace --all-targets --locked
