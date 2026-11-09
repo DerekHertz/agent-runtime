@@ -34,6 +34,7 @@ trace-store = { path = "crates/trace-store" }
 coordinator = { path = "crates/coordinator" }
 
 anyhow = "1"
+blake3 = "1.8"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

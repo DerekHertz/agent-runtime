@@ -1,14 +1,17 @@
 //! Trace store: the append-only SQLite trace of stamped events, one database per run
 //! (SPEC section 5, "Event schema" and "Layout").
 //!
-//! The coordinator is the only writer. This slice has a writer and a minimal in-order reader for
-//! tests; the in-memory query layer (`Run::load`, `happens_before`, ...) and the blob store arrive
-//! with later issues.
+//! The coordinator is the only writer. This slice has a writer, a minimal in-order reader for
+//! tests, and the run's blob store ([`BlobStore`]); the in-memory query layer (`Run::load`,
+//! `happens_before`, ...) arrives with a later issue.
 
 use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OpenFlags};
+
+mod blobs;
+pub use blobs::{BlobError, BlobHash, BlobStore, BLOBS_DIR};
 
 /// File name of the trace inside a run directory.
 pub const TRACE_FILE: &str = "trace.db";
