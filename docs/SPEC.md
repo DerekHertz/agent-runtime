@@ -68,7 +68,7 @@ The repository working tree is shared state that only the coordinator arbitrates
  | Agent sandbox N     | <------------------------> |   defer                   |      +---------+--------+
  | or own Rust loop    |                             |  gRPC server (tonic)      |                |
  +---------------------+                             +-------------+-------------+                v
-                                                                   | approved writes only   +------------------+
+                                                                   | gates agent writes     +------------------+
                                                                    v                        |      Viewer      |
                                                      +---------------------------+          | causal timeline  |
                                                      | Shared working tree (git) |          | ownership heatmap|
@@ -76,9 +76,13 @@ The repository working tree is shared state that only the coordinator arbitrates
                                                                                             +------------------+
 ```
 
-Agents never write to the tree directly; the coordinator admits or defers each edit, stamps it, and the viewer reads only the trace store.
+The coordinator never writes to the tree itself. It admits, denies or defers each edit before the agent's own tool performs it, and it stamps every event. The viewer reads only the trace store. See [ADR 0001](adr/0001-shared-tree-single-writer-leases.md).
 
-The **hook shim** is the only agent-facing code. On every PreToolUse for Edit, Write, MultiEdit or Bash, the shim sends the intended operation to the coordinator over gRPC and blocks on the answer: proceed, deny with reason, or defer. On every PostToolUse it reports the result, receives the merged vector clock, and stores it as the session's current clock. Claude Code's hook protocol allows a hook to block a tool call and return a message the model sees, so denial is surfaced to the agent as ordinary feedback.
+The **hook shim** is the only agent-facing code. On every PreToolUse for Edit, Write, NotebookEdit, Read or Bash, the shim sends the intended operation to the coordinator over gRPC and blocks on the answer: proceed, deny with reason, or defer. On every PostToolUse and PostToolUseFailure it reports the result. The shim is stateless: the coordinator holds each slot's clock (see section 5). Claude Code's hook protocol allows a hook to block a tool call and return a message the model sees, so denial is surfaced to the agent as ordinary feedback.
+
+**The shim fails closed.** Claude Code lets a tool call proceed when a hook times out or exits with an ordinary error. So if the shim cannot reach the coordinator, or fails internally, it denies the call (exit 2). A Defer must always finish inside the hook's configured timeout.
+
+**Slots and launching.** A launcher starts each session with environment variables naming its slot and the coordinator's socket, plus a settings file that registers the hooks. The coordinator maps each `session_id` to its slot, so a restarted session keeps its slot's clock. Without those variables the shim does nothing, so it never affects ordinary Claude Code sessions. The number of slots is fixed when a run starts.
 
 The **own-loop adapter** implements the same two calls (`BeforeTool`, `AfterTool`) from inside a Rust agent loop that calls the Claude API directly. Both adapters produce identical trace events, so the coordinator and viewer never know which one is running. The city simulator is built using this runtime, which is the dogfood path described under Milestones.
 
@@ -96,6 +100,8 @@ The working tree is treated as distributed shared memory with files as the unit 
 | Shared  | Agent has a current view; zero or more agents share it    | Read; request Owned                              |
 | Owned   | Agent holds the exclusive write lease                     | Read, write; must release                        |
 
+The coordinator enforces Invalid itself. The model's context can't be cleared, and Claude Code doesn't refuse an edit to a file that changed since it was read. So while a file is Invalid for an agent, that agent's request to take the lease is denied with "re-read first." Only the `Read` tool moves a file from Invalid to Shared; seeing it through Bash `cat` or `grep` doesn't count. A file the agent has never read starts Invalid. Creating a brand-new file needs no prior read.
+
 **Acquire.** On PreToolUse for any write tool, the shim sends `Acquire(path, agent, clock)`. The coordinator grants if no other agent holds Owned, otherwise returns one of:
 
 - `Deny(owner, reason)`: the agent is told who owns the file and what they are doing (the owner's declared intent string, if any). Claude Code surfaces this as the tool's error, and the model chooses another task or waits.
@@ -103,7 +109,7 @@ The working tree is treated as distributed shared memory with files as the unit 
 
 **Release.** A lease is released when the owning agent runs a PostToolUse on a test or build command that succeeds, when it emits an explicit `Release`, when its session ends, or when a lease TTL expires (default 10 min, renewed on each write). Release with changes invalidates every other agent's Shared copy of that file. The next read by any of them is served fresh and stamped with the writer's clock, which is what makes the causal trace meaningful.
 
-**Consistency model.** This is release consistency: writes are only guaranteed visible to others at release points, not at each write. That choice is deliberate. Agents make many small edits before a file is coherent, and exposing intermediate states to other agents would be worse than exposing none.
+**Consistency model.** v1 guarantees one writer per file at a time, with invalidation at release. It does *not* provide release consistency: all agents share one tree, so an owner's in-progress edits can be read and built by other agents as soon as they are on disk. That cost is measured in the trace, for example builds failing on another agent's half-finished file. If it turns out to be large, private trees per agent with publication at release are the next step. See [ADR 0001](adr/0001-shared-tree-single-writer-leases.md).
 
 **Granularity escalation (v2).** When two agents repeatedly contend for the same large file, the coordinator can split the lease to symbol level using tree-sitter: ownership of `fn parse_header` rather than `src/parser.rs`. Writes outside the owned span are rejected. Symbol-level leases coexist with file-level ones under a simple rule: a file lease excludes all symbol leases in that file and vice versa.
 
@@ -115,13 +121,16 @@ The working tree is treated as distributed shared memory with files as the unit 
 
 Every hook event carries a vector clock, so the trace store can answer "did agent B know about X when it did Y" exactly, not approximately.
 
-**Clock rules.** Each agent holds a vector `VC[agent_id] -> u64` with one entry per agent in the run. The shim applies the standard rules:
+**Clock rules.** Each slot has a vector `VC[slot] -> u64` with one entry per slot in the run. The coordinator holds every slot's clock, because shims are stateless. It applies these rules:
 
-1. Before sending any event, increment own entry.
-2. Attach the full vector to the event.
-3. On receiving a clock from the coordinator (every AfterTool response), take the element-wise max, then increment own entry.
+1. On each event from a slot, increment that slot's own entry and stamp the event with the slot's full vector.
+2. Merge another vector into a slot's clock (element-wise max) **only** through a knowledge channel:
+   - **Read:** the reader absorbs the file's clock.
+   - **Deny:** the denied agent absorbs the lease holder's clock from when it took the lease.
+   - **Barrier:** every participant absorbs every other participant's clock.
+3. Nothing else merges. The coordinator is not a clock participant, and it never sends a global merged view back to an agent.
 
-The coordinator is itself a participant with its own entry. It merges clocks on every message it handles, so a file read served after another agent's release carries that release's clock merged in. That one rule is what ties coherence and causality together: reading a file that agent A changed makes A's write happen-before everything you do next.
+This is what ties coherence and causality together: reading a file that agent A changed makes A's write happen-before everything you do next, and nothing else does. See [ADR 0002](adr/0002-explicit-knowledge-channels.md).
 
 **Event schema.** One row per event in the trace store:
 
@@ -247,7 +256,7 @@ The honest expectation is that leases trade some idle time for far fewer conflic
 
 Six milestones, each ending in something a coding agent can verify by running it; from M3 onward the runtime builds itself, and from M5 it builds the city simulator.
 
-1. **M1: Hook shim and trace (no coherence yet).** A Rust binary registered as Claude Code PreToolUse/PostToolUse hooks that stamps vector clocks and writes every event to SQLite. Two agents run on a toy repo; the store can answer `happens_before` for any pair.
+1. **M1: Hook shim and trace (no coherence yet).** A Rust shim binary registered as Claude Code hooks, plus a minimal coordinator that allows every call, holds the clocks and is the only process that writes the SQLite trace. Shims keep no state. Two agents run on a toy repo; the store can answer `happens_before` for any pair.
    *Done when:* a concurrent-write pair is detected in a deliberately conflicting run.
 2. **M2: File leases.** Coordinator with Acquire/Release/Deny/Defer and invalidation.
    *Done when:* the same conflicting run from M1 produces zero concurrent writes to one path, and the trace shows the Deny.
@@ -269,7 +278,7 @@ Milestones 1 through 4 are the resume deliverable on their own. M5 and M6 are wh
 - [ ] **Hook latency budget.** Claude Code runs hooks synchronously; if a Defer blocks for 60 s, does the session time out or degrade? Measure in M1 before committing to Defer semantics.
 - [ ] **Bash path extraction.** The conservative "touch everything" fallback may make Bash-heavy agents hold global leases constantly. Need trace data from M2 to decide how much static analysis is worth.
 - [ ] **Agent behavior on Deny.** Does the model retry the same edit, pick another task, or stall? If it stalls, the orchestrator needs a nudge mechanism, which is scope creep worth resisting.
-- [ ] **Clock identity across sessions.** A Claude Code session that restarts gets a new id; the clock should survive. Likely answer: the shim keys clocks by a run-scoped agent slot, not the session id.
+- [x] **Clock identity across sessions.** Resolved: clocks are keyed by a run-scoped slot that the launcher assigns through environment variables. The coordinator maps `session_id` to slot (section 3).
 - [ ] **Own-loop adapter priority.** It is cleaner but delays dogfooding. Current call: hooks first, own loop only if hooks prove too constraining by M2.
 - [ ] **Benchmark repository.** Needs enough parallelizable work for 10 agents and a fast test suite. The city sim itself is the candidate once M5 exists; before that, a mid-size open-source Rust crate.
 - [ ] **Vector clock growth with agent churn.** Pruning is deferred to v2; confirm that 8N bytes per event stays trivial at the agent counts actually used.
@@ -288,7 +297,7 @@ agent-runtime/
 ├── crates/
 │   ├── clock/                 # vector clock type + tests (property-based)
 │   ├── trace-store/           # SQLite schema, blob store, happens_before / knew / causal_past
-│   ├── coordinator/           # ownership table, admission, collectives, tonic server
+│   ├── coordinator/           # pure core: step(state, input, now) -> (state', outputs); tonic + SQLite + timers are adapters
 │   ├── shim/                  # Claude Code hook binary: parse hook JSON, call coordinator, emit verdict
 │   └── orchestrator-sdk/      # scatter/barrier/gather/allreduce client
 ├── viewer/                    # web app, reads trace-store over gRPC-web (M4)
