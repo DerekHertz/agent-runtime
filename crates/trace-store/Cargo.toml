@@ -1,0 +1,17 @@
+[package]
+name = "trace-store"
+description = "Append-only SQLite trace of stamped events, one per run (SPEC section 5)"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

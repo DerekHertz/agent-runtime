@@ -1,0 +1,1 @@
+{"session_id":"90c75de7-f344-4da3-9b24-152c5bfda374","cwd":"/work","hook_event_name":"PostToolUse","tool_name":"Edit","tool_input":{"file_path":"/work/src/lib.rs","old_string":"a","new_string":"b","replace_all":false},"tool_response":{"filePath":"/work/src/lib.rs"},"tool_use_id":"toolu_01Uy28i9ZxHpdQkCRWhbwK3g"}

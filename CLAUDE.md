@@ -1,22 +1,11 @@
-# agent-runtime
+# Claude Code project instructions
 
-Rust workspace. Solo project by Derek, implemented by Claude coding agents.
+@AGENTS.md
 
-- `docs/SPEC.md` is the contract. Build to it; raise anything under its "Open questions" as a question, not a guess.
-- `GLOSSARY.md` is the canonical domain vocabulary. Use its terms in code, docs and commit messages; don't use the words listed under _Avoid_.
-- `docs/adr/` records hard-to-reverse decisions. Read the relevant ADRs before changing architecture; supersede rather than silently contradict.
-- Each milestone has a "Done when" line in the spec. A milestone is done only when that check passes by running it.
+## Completion handoff
 
-## Agent skills
+At task completion, invoke Codex through Bash from the project root; do not merely recommend a review. For an entirely uncommitted task run `codex review --uncommitted`. For a task branch run `codex review --base <actual-base>`, or use `codex review --commit <sha>` for an explicitly selected commit. Inspect `codex review --help` before combining options. If committed changes coexist with uncommitted repairs, review both scopes explicitly unless coverage of both is verified.
 
-### Issue tracker
+Capture and read the actual findings, using ignored `.claude/reviews/` files when needed. Follow the review/repair loop in AGENTS.md, with at most three repair rounds. If Codex is unavailable, report that independent review is incomplete; do not substitute self-review. Do not edit while Codex is reviewing.
 
-Issues live in GitHub Issues for DerekHertz/agent-runtime, managed with the `gh` CLI. See `docs/agents/issue-tracker.md`.
-
-### Triage labels
-
-Default labels: needs-triage, needs-info, ready-for-agent, ready-for-human, wontfix. See `docs/agents/triage-labels.md`.
-
-### Domain docs
-
-Single context: `GLOSSARY.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+Rerun setup in a new checkout or worktree so its local `autoMemoryDirectory` points to that checkout's `.agents/memory`, not another branch's memory.

@@ -1,0 +1,30 @@
+[package]
+name = "coordinator"
+description = "The coordinator: a pure core (`core::step`) behind tonic and SQLite adapters"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "art-coordinator"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+clock.workspace = true
+runtime-proto.workspace = true
+trace-store.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tonic.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tower = { workspace = true, features = ["util"] }
+hyper-util.workspace = true
+rusqlite.workspace = true

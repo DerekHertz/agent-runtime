@@ -1,0 +1,34 @@
+// Source of truth for the shim <-> coordinator protocol (docs/SPEC.md section 7).
+//
+// Only the RPC that issue #2 needs is defined here. AfterTool, Release, Attach and the
+// Orchestration service arrive with the issues that implement them, so their message shapes
+// are not guessed ahead of time.
+syntax = "proto3";
+
+package agent_runtime.v1;
+
+service Coordinator {
+  // Hook path, called by every agent's shim.
+  rpc BeforeTool(BeforeToolRequest) returns (Admission);
+}
+
+// No clocks in shim-facing messages: the coordinator holds every slot's clock (section 5).
+message BeforeToolRequest {
+  string slot = 1;
+  string session_id = 2;
+  string tool = 3;            // Edit, Write, NotebookEdit, Read, Bash
+  string tool_input_json = 4; // raw hook tool_input; the coordinator core classifies it (paths, Bash class)
+  string intent = 5;          // Bash `description` when present, else empty; agents are never prompted for it
+}
+
+message Admission {
+  enum Verdict {
+    ALLOW = 0;
+    DENY = 1;
+    DEFER = 2;
+  }
+  Verdict verdict = 1;
+  string reason = 2;
+  string owner = 3;
+  string updated_input_json = 4; // set when a Read is redirected to a released snapshot
+}
