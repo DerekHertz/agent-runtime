@@ -90,4 +90,3 @@ The complete frozen implementation was verified with real dependencies and Unix-
 - Independent native-agent recheck and separate Codex CLI review found no actionable regressions. The CLI sandbox could not bind Unix sockets; the chief's binding-enabled run above passed them all.
 
 Numbered command logs, source manifests and review output are retained locally under `.claude/reviews/issue3-pr3-*`. Hosted CI is shown on the attached PR. Human feedback is still pending; none of these automated results authorize merging.
-
