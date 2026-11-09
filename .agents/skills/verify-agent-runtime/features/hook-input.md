@@ -23,7 +23,7 @@ Preconditions:
 - **PostToolUse.** Run `verify.py drive hook-input`. The PostToolUse Edit fixture as `slot-1`: exit `0`, stdout `""`, stderr `""`.
 - **Malformed.** Stdin `not json`, `""`, `[]`: each exits `2`, stdout `""`, stderr starts `agent-runtime:`.
 - **Missing fields.** The Edit fixture with one of `session_id`, `tool_name`, `tool_input` removed: each exits `2`.
-- **Trace.** `trace.db` has zero rows.
+- **Trace.** `trace.db` has zero rows and `runs/r1/blobs/` is empty.
 - **Control.** The intact Edit fixture is then allowed as event `1`.
 
 ## Gotchas

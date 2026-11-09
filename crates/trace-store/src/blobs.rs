@@ -158,6 +158,15 @@ impl BlobStore {
     }
 }
 
+/// The exact bytes of the blob named `hash` in `run_dir/blobs`, for readers of a run: unlike
+/// [`BlobStore::open`], this creates and flushes nothing, so it also works on a read-only run or
+/// one written before blobs existed (where every blob is [`BlobError::Missing`]). Refuses a file
+/// whose content does not hash to its name.
+pub fn read_blob(run_dir: &Path, hash: &BlobHash) -> Result<Vec<u8>, BlobError> {
+    let path = run_dir.join(BLOBS_DIR).join(hash.to_string());
+    read_verified(&path, hash).map(|(_, bytes)| bytes)
+}
+
 /// Read the file at `path` and check that it hashes to `hash`; return the open file and its bytes.
 fn read_verified(path: &Path, hash: &BlobHash) -> Result<(File, Vec<u8>), BlobError> {
     let mut file = match File::open(path) {

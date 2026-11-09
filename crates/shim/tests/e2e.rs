@@ -9,7 +9,7 @@ use std::process::{Command, Output, Stdio};
 use clock::Clock;
 use coordinator::adapter::{bind, ServeConfig};
 use serde_json::Value;
-use trace_store::{read_events, EventKind, TRACE_FILE};
+use trace_store::{read_events, read_payload, BlobHash, EventKind, TRACE_FILE};
 
 const EDIT: &str = include_str!("fixtures/pre_tool_use_edit.json");
 
@@ -89,7 +89,16 @@ async fn recorded_pre_tool_use_is_allowed_and_one_stamped_event_is_traced() {
         tool_input: &'a serde_json::value::RawValue,
     }
     let raw: Raw = serde_json::from_str(EDIT).unwrap();
-    assert_eq!(event.tool_input.as_deref(), Some(raw.tool_input.get()));
+    // It lives in the run's blob store; the row holds only its blake3 hash.
+    assert_eq!(event.tool_input, None);
+    assert_eq!(
+        event.payload_hash.as_deref(),
+        Some(&BlobHash::of(raw.tool_input.get().as_bytes()).as_bytes()[..])
+    );
+    assert_eq!(
+        read_payload(&run_dir, event).unwrap().as_deref(),
+        Some(raw.tool_input.get().as_bytes())
+    );
     // Stamped with slot-2's clock after its first event: [0, 1].
     let stamp = Clock::from_bytes(&event.vclock).unwrap();
     assert_eq!(stamp.entries(), &[0, 1]);

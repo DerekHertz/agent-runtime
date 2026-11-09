@@ -352,8 +352,10 @@ class Ctx:
                 q = "SELECT event_id, agent_id, session_id, vclock, kind, tool, path, payload_hash, tool_input, wall_time FROM events ORDER BY event_id"
                 for r in conn.execute(q):
                     n = len(r[3]) // 8
+                    source, payload = resolve_payload(run_dir, r[7], r[8])
                     rows.append({"event_id": r[0], "slot": r[1], "session_id": r[2], "vclock": list(struct.unpack(f"<{n}Q", r[3])),
-                                 "kind": r[4], "tool": r[5], "path": r[6], "payload_hash": r[7], "tool_input": r[8], "wall_time": r[9]})
+                                 "kind": r[4], "tool": r[5], "path": r[6], "payload_hash": r[7].hex() if r[7] is not None else None,
+                                 "tool_input": r[8], "payload_source": source, "payload": payload, "wall_time": r[9]})
             finally:
                 conn.close()
         (self.dir / f"trace-{label}.json").write_text(json.dumps({"db": str(db), "rows": rows}, indent=2) + "\n")
@@ -367,6 +369,24 @@ class Ctx:
     def drop_scratch(self, d):
         rm_scratch(d)
         unregister(lambda e: e.get("kind") == "scratch" and e["scratch"] == str(d))
+
+
+def resolve_payload(run_dir, payload_hash, inline):
+    """Where a row's payload lives and its exact text: ("blob", text) read from blobs/<hex of the
+    hash>, ("inline", text) for an issue #2 row, ("none", None), or ("missing", None) when the row
+    names a blob that is not there (or a hash that is not 32 bytes). The blob's name is not
+    rehashed here: python's stdlib has no blake3, so hash correctness is the Rust tests' job."""
+    if payload_hash is None:
+        return ("inline", inline) if inline is not None else ("none", None)
+    blob = pathlib.Path(run_dir) / "blobs" / payload_hash.hex()
+    if len(payload_hash) != 32 or not blob.is_file():
+        return ("missing", None)
+    return ("blob", blob.read_bytes().decode("utf-8", "surrogateescape"))
+
+
+def blob_names(run_dir):
+    d = pathlib.Path(run_dir) / "blobs"
+    return sorted(p.name for p in d.iterdir()) if d.is_dir() else None
 
 
 def raw_tool_input(text):
@@ -427,8 +447,13 @@ def j_admitted_tool_call(c):
                 row={k: e.get(k) for k in ("kind", "slot", "session_id", "tool")})
         c.check("event_id is 1 and vclock is [0,1]", (e.get("event_id"), e.get("vclock")) == (1, [0, 1]),
                 event_id=e.get("event_id"), vclock=e.get("vclock"))
-        c.check("tool_input is byte-identical to the fixture's raw tool_input", e.get("tool_input") == raw_tool_input(edit),
-                stored=e.get("tool_input"))
+        c.check("the row keeps no inline tool_input", e.get("tool_input") is None, stored=e.get("tool_input"))
+        h = e.get("payload_hash")
+        c.check("payload_hash is 32 bytes and names the only file in blobs/",
+                h is not None and len(h) == 64 and blob_names(s / "runs/r1") == [h], payload_hash=h, blobs=blob_names(s / "runs/r1"))
+        c.check("the blob's bytes are byte-identical to the fixture's raw tool_input",
+                (e.get("payload_source"), e.get("payload")) == ("blob", raw_tool_input(edit)),
+                source=e.get("payload_source"), stored=e.get("payload"))
         # wall_time is display-only (SPEC section 5): recorded as evidence, never a pass/fail criterion.
         (c.dir / "wall-time.txt").write_text(f"call window {t0}..{t1} ms; event wall_time {e.get('wall_time')} (informational only)\n")
         c.check("coordinator stderr announces its socket", f"listening on {co.socket}" in (c.dir / "coordinator-a.stderr").read_text())
@@ -531,6 +556,7 @@ def j_unknown_slot(c):
         c.check("shim exits 0 with a deny decision", r["exit_code"] == 0 and decision == "deny", exit_code=r["exit_code"], stdout=r["stdout"])
         c.check("deny reason names the unknown slot", 'unknown slot "slot-9"' in reason, reason=reason)
         c.check("no event was recorded", c.rows("after-unknown", s / "runs/r1") == [])
+        c.check("no payload blob was stored for the denied call", blob_names(s / "runs/r1") == [], blobs=blob_names(s / "runs/r1"))
         r = c.shim("valid-after-unknown", "slot-1", co.socket, edit)
         rows = c.rows("after-valid", s / "runs/r1")
         c.check("a valid slot afterwards is allowed as event 1 with vclock [1,0] (the deny consumed nothing)",
@@ -553,8 +579,12 @@ def j_clocks(c):
         c.check("each slot's own counter advances, the other's stays put: [1,0] [0,1] [2,0]",
                 [x["vclock"] for x in rows] == [[1, 0], [0, 1], [2, 0]], vclocks=[x["vclock"] for x in rows])
         c.check("slots recorded in call order", [x["slot"] for x in rows] == ["slot-1", "slot-2", "slot-1"])
-        c.check("Bash call stored with tool Bash and raw tool_input byte-identical",
-                len(rows) > 1 and rows[1]["tool"] == "Bash" and rows[1]["tool_input"] == raw_tool_input(bash))
+        c.check("Bash call stored with tool Bash and its blob byte-identical to the raw tool_input",
+                len(rows) > 1 and rows[1]["tool"] == "Bash" and (rows[1]["payload_source"], rows[1]["payload"]) == ("blob", raw_tool_input(bash)))
+        hashes = [x["payload_hash"] for x in rows]
+        c.check("the two Edit calls share one blob; blobs/ holds exactly the Edit and Bash blobs, no temporary files",
+                len(rows) == 3 and hashes[0] == hashes[2] != hashes[1] and blob_names(s / "runs/r1") == sorted({hashes[0], hashes[1]}),
+                payload_hashes=hashes, blobs=blob_names(s / "runs/r1"))
         co.stop()
     finally:
         c.drop_scratch(s)
@@ -576,6 +606,7 @@ def j_hook_input(c):
             r = c.shim(f"missing-{field}", "slot-1", co.socket, json.dumps(d))
             c.check(f"PreToolUse without {field}: exit 2", is_blocked(r), exit_code=r["exit_code"], stderr=r["stderr"])
         c.check("none of those reached the trace", c.rows("after-bad-input", s / "runs/r1") == [])
+        c.check("...or the blob store", blob_names(s / "runs/r1") == [], blobs=blob_names(s / "runs/r1"))
         r = c.shim("valid-after", "slot-1", co.socket, edit)
         c.check("a valid call afterwards is allowed as event 1", r["exit_code"] == 0 and [x["event_id"] for x in c.rows("final", s / "runs/r1")] == [1])
         co.stop()

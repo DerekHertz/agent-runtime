@@ -2,4 +2,5 @@
 129ebcbbb71fbea95dd8697a25e06a4f114aa6cedd31a038f02dcefee65763b2  crates/coordinator/src/core/mod.rs
 2e0c46d4bb87151b1793325164b011c4deacdaafe6e45f6dbc9d970c4ac7cf7c  crates/coordinator/src/core/clocks.rs
 85fd8e615f07a87da9714e21f4dc10665200662b589d4155970be9c3f1d24609  crates/clock/src/lib.rs
-3622922c8f7556c1b6ca47c460ff90ed2c9e0af93d085ac90101d120f0d2e5ae  crates/trace-store/src/lib.rs
+669d3aba57ced99cb66c84f29ae00e128c0bd85439b32d7bfec04e4a3d848786  crates/trace-store/src/lib.rs
+cdf5c7613a514e6a901dc5b00f2f3dce5ee70cf5c88dee2b77f59817fbc2d969  crates/trace-store/src/blobs.rs

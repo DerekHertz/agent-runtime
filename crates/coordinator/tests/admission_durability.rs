@@ -9,7 +9,10 @@
 //! (b) the trace's event ids are 1, 2, 3, ...: unique, increasing, none skipped;
 //! (c) a failed append leaves the core state alone, so the retry reuses the same id and stamp;
 //! (d) each slot's stamps strictly increase;
-//! (e) concurrent calls never make each other fail.
+//! (e) concurrent calls never make each other fail;
+//! (f) every payload a row names is a stored blob: the blob is written before its row, a failed
+//!     blob write leaves no row and the state alone, and a failed row leaves at most an orphan
+//!     blob that no row names.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -21,7 +24,7 @@ use runtime_proto::v1::admission::Verdict;
 use runtime_proto::v1::coordinator_server::Coordinator;
 use runtime_proto::v1::BeforeToolRequest;
 use tonic::{Code, Request};
-use trace_store::{read_events, Event, TraceWriter, TRACE_FILE};
+use trace_store::{read_events, read_payload, BlobHash, Event, TraceWriter, BLOBS_DIR, TRACE_FILE};
 
 fn service(dir: &Path, slots: &[&str]) -> CoordinatorService {
     let config = RunConfig {
@@ -45,11 +48,27 @@ fn trace(dir: &Path) -> Vec<Event> {
     read_events(&dir.join(TRACE_FILE)).unwrap()
 }
 
-fn has_call(events: &[Event], call: &str) -> bool {
-    let want = format!(r#"{{"call":"{call}"}}"#);
-    events
-        .iter()
-        .any(|e| e.tool_input.as_deref() == Some(want.as_str()))
+fn raw_input(call: &str) -> String {
+    format!(r#"{{"call":"{call}"}}"#)
+}
+
+/// Whether one of `events` is the row of `call`, by its payload read back from its blob. Every
+/// row's payload must resolve: a row naming a missing blob fails the test (rule f).
+fn has_call(dir: &Path, events: &[Event], call: &str) -> bool {
+    let want = raw_input(call).into_bytes();
+    events.iter().any(|e| {
+        let payload = read_payload(dir, e).expect("every row's payload blob resolves");
+        payload.as_deref() == Some(want.as_slice())
+    })
+}
+
+fn blob_files(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir.join(BLOBS_DIR))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
 }
 
 fn stamp(e: &Event) -> Vec<u64> {
@@ -71,7 +90,7 @@ async fn an_allow_has_its_event_in_the_trace_when_the_reply_returns() {
         assert_eq!(adm.verdict, Verdict::Allow as i32);
         let events = trace(tmp.path());
         assert!(
-            has_call(&events, &call),
+            has_call(tmp.path(), &events, &call),
             "Allow for {call} before its event"
         );
         assert_eq!(events.len(), n + 1);
@@ -104,7 +123,7 @@ async fn a_failed_append_leaves_the_state_alone_and_the_retry_reuses_id_and_stam
     let failed = svc.before_tool(request("slot-2", "failed")).await;
     let err = failed.expect_err("a failed append must be an error, never an Allow");
     assert_eq!(err.code(), Code::Internal);
-    assert!(!has_call(&trace(tmp.path()), "failed"));
+    assert!(!has_call(tmp.path(), &trace(tmp.path()), "failed"));
 
     // A second failure changes nothing either: still the same would-be id and stamp.
     assert!(svc
@@ -132,7 +151,10 @@ async fn a_failed_append_leaves_the_state_alone_and_the_retry_reuses_id_and_stam
     let events = trace(tmp.path());
     let ids: Vec<u64> = events.iter().map(|e| e.event_id).collect();
     assert_eq!(ids, vec![1, 2, 3], "ids consecutive, none skipped");
-    assert!(has_call(&events[1..2], "retry"), "the retry took id 2");
+    assert!(
+        has_call(tmp.path(), &events[1..2], "retry"),
+        "the retry took id 2"
+    );
     assert_eq!(stamp(&events[0]), vec![1, 0]);
     assert_eq!(
         stamp(&events[1]),
@@ -194,7 +216,10 @@ async fn concurrent_calls_get_consecutive_ids_and_increasing_stamps_and_never_co
     assert_eq!(ids, (1..=total as u64).collect::<Vec<_>>());
     for t in 0..TASKS {
         for i in 0..PER_TASK {
-            assert!(has_call(&events, &format!("t{t}-{i}")), "t{t}-{i} lost");
+            assert!(
+                has_call(tmp.path(), &events, &format!("t{t}-{i}")),
+                "t{t}-{i} lost"
+            );
         }
     }
     // Each slot's own entry counts 1, 2, 3, ... in id order.
@@ -207,4 +232,90 @@ async fn concurrent_calls_get_consecutive_ids_and_increasing_stamps_and_never_co
         assert_eq!(own, (1..=own.len() as u64).collect::<Vec<_>>(), "{slot}");
         assert_eq!(own.len(), total / 2);
     }
+}
+
+/// Model action `BlobFails`, then a retry; rules (c) and (f). The blob directory is made
+/// read-only, so the real `BlobStore::put` cannot create its temporary file: the call errors,
+/// no row and no file appear, and the state is untouched. With write access back, the retry of
+/// the same call gets the failed call's id and stamp.
+#[tokio::test]
+async fn a_failed_blob_write_leaves_no_row_and_the_retry_reuses_id_and_stamp() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let svc = service(tmp.path(), &["slot-1", "slot-2"]);
+    svc.before_tool(request("slot-1", "first")).await.unwrap();
+    let blobs = tmp.path().join(BLOBS_DIR);
+    let before = blob_files(tmp.path());
+
+    std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let failed = svc.before_tool(request("slot-1", "second")).await;
+    let again = svc.before_tool(request("slot-1", "second")).await;
+    std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let err = failed.expect_err("a failed blob write must be an error, never an Allow");
+    assert_eq!(err.code(), Code::Internal);
+    assert!(err.message().contains("blob"), "{}", err.message());
+    assert!(again.is_err());
+    assert_eq!(trace(tmp.path()).len(), 1, "no row for the failed call");
+    assert_eq!(
+        blob_files(tmp.path()),
+        before,
+        "no blob or temporary file left"
+    );
+
+    let retry = svc
+        .before_tool(request("slot-1", "second"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(retry.verdict, Verdict::Allow as i32);
+    let events = trace(tmp.path());
+    let ids: Vec<u64> = events.iter().map(|e| e.event_id).collect();
+    assert_eq!(ids, vec![1, 2]);
+    assert_eq!(stamp(&events[1]), vec![2, 0], "the failures ticked nothing");
+    assert!(has_call(tmp.path(), &events[1..], "second"));
+}
+
+/// Model action `AppendFails` after `BlobOk`; rule (f). The blob is stored, then the INSERT
+/// collides with a planted row: the call errors and the blob stays as an orphan that no row
+/// names. The retry of the same payload reuses that one blob file.
+#[tokio::test]
+async fn a_failed_row_after_its_blob_leaves_a_harmless_orphan_that_the_retry_reuses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let svc = service(tmp.path(), &["slot-1"]);
+    let db = rusqlite::Connection::open(tmp.path().join(TRACE_FILE)).unwrap();
+    db.execute(
+        "INSERT INTO events (event_id, agent_id, session_id, vclock, kind, wall_time)
+         VALUES (1, 'planted', 'x', x'', 'BeforeTool', 0)",
+        [],
+    )
+    .unwrap();
+
+    let err = svc
+        .before_tool(request("slot-1", "orphan"))
+        .await
+        .expect_err("the INSERT collides");
+    assert_eq!(err.code(), Code::Internal);
+    let orphan = BlobHash::of(raw_input("orphan").as_bytes()).to_string();
+    assert_eq!(blob_files(tmp.path()), vec![orphan.clone()]);
+    let rows = trace(tmp.path());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].slot, "planted",
+        "only the planted row is in the trace"
+    );
+
+    db.execute_batch("DROP TRIGGER events_no_delete; DELETE FROM events WHERE event_id = 1;")
+        .unwrap();
+    let retry = svc
+        .before_tool(request("slot-1", "orphan"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(retry.verdict, Verdict::Allow as i32);
+    let events = trace(tmp.path());
+    assert_eq!(events.len(), 1);
+    assert_eq!((events[0].event_id, stamp(&events[0])), (1, vec![1]));
+    assert!(has_call(tmp.path(), &events, "orphan"));
+    assert_eq!(blob_files(tmp.path()), vec![orphan], "one file, reused");
 }

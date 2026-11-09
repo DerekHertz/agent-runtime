@@ -2,8 +2,21 @@
 //! (SPEC section 5, "Event schema" and "Layout").
 //!
 //! The coordinator is the only writer. This slice has a writer, a minimal in-order reader for
-//! tests, and the run's blob store ([`BlobStore`]); the in-memory query layer (`Run::load`,
-//! `happens_before`, ...) arrives with a later issue.
+//! tests and tooling ([`read_events`], [`read_payload`]), and the run's blob store
+//! ([`BlobStore`]); the in-memory query layer (`Run::load`, `happens_before`, ...) arrives with a
+//! later issue.
+//!
+//! Payloads: [`TraceWriter::append`] stores an event's raw tool input as a blob in
+//! `runs/<run-id>/blobs/` and only then inserts the row, which keeps the blob's hash in
+//! `payload_hash` and leaves `tool_input` NULL. So a row never names a blob that is missing or
+//! not yet flushed; an append whose INSERT fails can leave an orphan blob, which nothing reads.
+//! Traces written before blobs (issue #2) keep the raw input inline in `tool_input`;
+//! [`read_payload`] reads either form.
+//!
+//! File-system assumptions: when the writer starts, it flushes the run directory and every
+//! directory on its canonical path up to its filesystem's anchor (the topmost directory on the
+//! same device), whether or not it created them. Blob durability relies on the OS and drive honouring `fsync` (`F_FULLFSYNC`
+//! on macOS), as described in the `blobs` module. Rows rely on SQLite's default durability.
 
 use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
@@ -11,7 +24,8 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OpenFlags};
 
 mod blobs;
-pub use blobs::{BlobError, BlobHash, BlobStore, BLOBS_DIR};
+mod durable_dir;
+pub use blobs::{read_blob, BlobError, BlobHash, BlobStore, BLOBS_DIR};
 
 /// File name of the trace inside a run directory.
 pub const TRACE_FILE: &str = "trace.db";
@@ -75,10 +89,17 @@ pub struct Event {
     pub kind: EventKind,
     pub tool: Option<String>,
     pub path: Option<String>,
+    /// The full 32-byte blake3 hash of the event's payload, stored in the run's `blobs/`. Only
+    /// [`TraceWriter::append`] sets it: an event handed to `append` with a hash is refused, so
+    /// every hash in the trace names a blob the writer stored and flushed first.
     pub payload_hash: Option<Vec<u8>>,
     /// The raw hook `tool_input` JSON, exactly as the shim forwarded it, so a run can be
-    /// re-classified offline (SPEC section 7). Kept inline until the blob store arrives; then the
-    /// content moves to `blobs/` and `payload_hash` references it.
+    /// re-classified offline (SPEC section 7).
+    ///
+    /// Given to [`TraceWriter::append`], it is the payload to store: the writer moves it into a
+    /// blob and the row keeps only `payload_hash`. Read back with [`read_events`], it is `Some`
+    /// only for rows written before blobs (issue #2 traces), which kept it inline. Use
+    /// [`read_payload`] to get the bytes from either form.
     pub tool_input: Option<String>,
     /// Milliseconds since the Unix epoch. Display only, never for ordering.
     pub wall_time: i64,
@@ -103,6 +124,14 @@ pub enum Error {
     RunNotEmpty { path: PathBuf, events: u64 },
     #[error("run {path} is already held by another coordinator")]
     RunInUse { path: PathBuf },
+    #[error("payload blob error: {0}")]
+    Blob(#[from] BlobError),
+    #[error("event {event_id} arrived with a payload_hash; only the writer may set one")]
+    PayloadHashSupplied { event_id: u64 },
+    #[error("trace row {event_id} has a {len}-byte payload_hash, not 32 bytes")]
+    BadPayloadHash { event_id: u64, len: usize },
+    #[error("trace row {event_id} has both a payload_hash and an inline tool_input")]
+    TwoPayloads { event_id: u64 },
 }
 
 // event_id is the primary key, so a duplicate id fails. UPDATE and DELETE are refused by
@@ -126,24 +155,28 @@ CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events
 BEGIN SELECT RAISE(ABORT, 'trace is append-only'); END;
 ";
 
-/// The single writer of a run's trace. Append-only: there is no update or delete.
+/// The single writer of a run's trace and its payload blobs. Append-only: there is no update or
+/// delete.
 #[derive(Debug)]
 pub struct TraceWriter {
     conn: Connection,
+    blobs: BlobStore,
     /// Holds an exclusive lock on `run_dir/trace.lock` for the writer's lifetime, so a second
     /// coordinator on the same run is refused even before either has recorded an event.
     _lock: File,
 }
 
 impl TraceWriter {
-    /// Open `run_dir/trace.db`, creating the directory and the schema if absent. Refused while
-    /// another writer holds the run, and refused if the trace already holds events: the
-    /// coordinator's clocks and event ids start from zero, so writing on would restamp history.
+    /// Open `run_dir/trace.db` and `run_dir/blobs/`, creating the directory and the schema if
+    /// absent. The run directory and each directory above it up to its filesystem's anchor are
+    /// flushed, even ones that already existed, since a concurrent start may have created them
+    /// without flushing yet. So the run directory is durable before any blob is stored in it (the
+    /// [`BlobStore`] contract).
+    /// Refused while another writer holds the run, and refused if the trace already holds events:
+    /// the coordinator's clocks and event ids start from zero, so writing on would restamp
+    /// history. A refused run gets no `blobs/` directory.
     pub fn create(run_dir: &Path) -> Result<Self, Error> {
-        std::fs::create_dir_all(run_dir).map_err(|source| Error::Io {
-            path: run_dir.to_path_buf(),
-            source,
-        })?;
+        durable_dir::create(run_dir).map_err(|(path, source)| Error::Io { path, source })?;
         let lock_path = run_dir.join(LOCK_FILE);
         let lock = File::options()
             .create(true)
@@ -178,13 +211,33 @@ impl TraceWriter {
                 events: events as u64,
             });
         }
-        Ok(Self { conn, _lock: lock })
+        let blobs = BlobStore::open(run_dir)?;
+        Ok(Self {
+            conn,
+            blobs,
+            _lock: lock,
+        })
     }
 
-    /// Append one event. Each call is its own transaction, so a returned `Ok` is durable
-    /// to SQLite's default guarantees. Fails if `event_id` already exists.
+    /// Append one event. If it carries a `tool_input`, those exact bytes are first stored and
+    /// flushed as a blob; the row then holds the blob's hash in `payload_hash` and NULL in
+    /// `tool_input`. If storing the blob fails, nothing is inserted. If the INSERT fails, the
+    /// stored blob stays as an orphan that no row names; storing the same bytes again reuses it.
+    ///
+    /// Each call is its own transaction, so a returned `Ok` is durable to SQLite's default
+    /// guarantees. Fails if `event_id` already exists, or if the event already has a
+    /// `payload_hash` (only this writer may set one).
     pub fn append(&mut self, event: &Event) -> Result<(), Error> {
         let id = to_row_id(event.event_id)?;
+        if event.payload_hash.is_some() {
+            return Err(Error::PayloadHashSupplied {
+                event_id: event.event_id,
+            });
+        }
+        let payload_hash = match &event.tool_input {
+            Some(input) => Some(self.blobs.put(input.as_bytes())?.as_bytes().to_vec()),
+            None => None,
+        };
         self.conn.execute(
             "INSERT INTO events
                 (event_id, agent_id, session_id, vclock, kind, tool, path, payload_hash,
@@ -198,8 +251,8 @@ impl TraceWriter {
                 event.kind.as_str(),
                 event.tool,
                 event.path,
-                event.payload_hash,
-                event.tool_input,
+                payload_hash,
+                Option::<String>::None,
                 event.wall_time,
             ],
         )?;
@@ -268,6 +321,30 @@ pub fn read_events(db_path: &Path) -> Result<Vec<Event>, Error> {
     Ok(events)
 }
 
+/// The exact payload bytes of `event`, a row read from the trace in `run_dir`: from its blob when
+/// it has a `payload_hash`, from the inline `tool_input` column for a row written before blobs
+/// (an issue #2 trace), and `None` when it has neither. The blob is rehashed on read, so a
+/// missing or corrupt blob is an error, never wrong bytes. Reading creates nothing in `run_dir`.
+pub fn read_payload(run_dir: &Path, event: &Event) -> Result<Option<Vec<u8>>, Error> {
+    match (&event.payload_hash, &event.tool_input) {
+        (Some(_), Some(_)) => Err(Error::TwoPayloads {
+            event_id: event.event_id,
+        }),
+        (Some(hash), None) => {
+            let hash: [u8; 32] = hash
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::BadPayloadHash {
+                    event_id: event.event_id,
+                    len: hash.len(),
+                })?;
+            Ok(Some(read_blob(run_dir, &BlobHash::from(hash))?))
+        }
+        (None, Some(inline)) => Ok(Some(inline.clone().into_bytes())),
+        (None, None) => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,15 +377,55 @@ mod tests {
     fn appended_events_round_trip_in_event_id_order() {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = TraceWriter::create(tmp.path()).unwrap();
+        let raw = r#"{"file_path":"src/lib.rs", "x":1}"#;
         let mut full = event(2, EventKind::AfterTool);
         full.path = Some("src/lib.rs".into());
-        full.payload_hash = Some(vec![9; 32]);
-        full.tool_input = Some(r#"{"file_path":"src/lib.rs", "x":1}"#.into());
+        full.tool_input = Some(raw.into());
         w.append(&full).unwrap();
         w.append(&event(1, EventKind::BeforeTool)).unwrap();
 
         let got = read_events(&tmp.path().join(TRACE_FILE)).unwrap();
-        assert_eq!(got, vec![event(1, EventKind::BeforeTool), full]);
+        // The row keeps the payload's hash, not the payload.
+        let mut stored = full.clone();
+        stored.tool_input = None;
+        stored.payload_hash = Some(BlobHash::of(raw.as_bytes()).as_bytes().to_vec());
+        assert_eq!(got, vec![event(1, EventKind::BeforeTool), stored]);
+        assert_eq!(read_payload(tmp.path(), &got[0]).unwrap(), None);
+        assert_eq!(
+            read_payload(tmp.path(), &got[1]).unwrap().as_deref(),
+            Some(raw.as_bytes())
+        );
+    }
+
+    #[test]
+    fn an_event_with_a_caller_supplied_hash_is_refused_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = TraceWriter::create(tmp.path()).unwrap();
+        let mut forged = event(1, EventKind::BeforeTool);
+        forged.payload_hash = Some(vec![7; 32]);
+        let err = w.append(&forged).unwrap_err();
+        assert!(
+            matches!(err, Error::PayloadHashSupplied { event_id: 1 }),
+            "{err}"
+        );
+        assert!(read_events(&tmp.path().join(TRACE_FILE))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_refused_run_gets_no_blobs_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        drop(TraceWriter::create(tmp.path()).unwrap());
+        std::fs::remove_dir(tmp.path().join(BLOBS_DIR)).unwrap();
+        let held = TraceWriter::create(tmp.path()).unwrap();
+        std::fs::remove_dir(tmp.path().join(BLOBS_DIR)).unwrap();
+        assert!(matches!(
+            TraceWriter::create(tmp.path()).unwrap_err(),
+            Error::RunInUse { .. }
+        ));
+        assert!(!tmp.path().join(BLOBS_DIR).exists());
+        drop(held);
     }
 
     #[test]

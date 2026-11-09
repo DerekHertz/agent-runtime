@@ -6,7 +6,8 @@ Each admitted call advances only its own slot's counter in that slot's clock and
 
 - `clocks-ids` numbers events 1, 2, 3 in call order.
 - `clocks-own-counter` advances only the calling slot's entry.
-- `clocks-bash` records a Bash call with its raw `tool_input`.
+- `clocks-bash` records a Bash call with its raw `tool_input` in a blob.
+- `clocks-blob-dedup` stores the two identical Edit inputs as one blob.
 
 ## How to get to it (user POV)
 
@@ -21,7 +22,8 @@ Preconditions:
 
 - **Three calls.** Run `verify.py drive slot-clocks`. Edit fixture as `slot-1`, Bash fixture as `slot-2`, Edit fixture as `slot-1`. Each exits `0` with the allow decision.
 - **Ids and clocks.** Read `trace.db`: `event_id` is `1,2,3`; `agent_id` is `slot-1,slot-2,slot-1`; `vclock` is `[1,0]`, `[0,1]`, `[2,0]`.
-- **Bash row.** Row 2 has `tool=Bash` and `tool_input` byte-identical to the Bash fixture's raw `tool_input`.
+- **Bash row.** Row 2 has `tool=Bash`, and the blob its `payload_hash` names is byte-identical to the Bash fixture's raw `tool_input`.
+- **Deduplication.** Rows 1 and 3 have the same `payload_hash`, which differs from row 2's. `runs/r1/blobs/` holds exactly those two files and no temporary file.
 
 ## Gotchas
 

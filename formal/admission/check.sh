@@ -112,12 +112,20 @@ if [ "$want_model" = 1 ]; then
     fail=1
     row "FAIL  witness: the case rule (c) is about is not reachable, so a pass would be vacuous (log $OUT/witness.log)"
   fi
+  tlc orphan-witness AdmissionOrphanWitness.cfg
+  if grep -q "Invariant OrphanNotReached is violated" "$OUT/orphan-witness.log"; then
+    row "PASS  orphan witness: the model reaches 'a blob was stored, its row failed, no row names it' ($(path_of "$OUT/orphan-witness.log"))"
+  else
+    fail=1
+    row "FAIL  orphan witness: the orphan case rule (f) allows is not reachable (log $OUT/orphan-witness.log)"
+  fi
 
   # Each broken variant must be caught, by the rule named here (mutants/<variant>.cfg checks
   # that one rule alone, so every rule is seen to fail at least once).
   for pair in commit_before_append:CoreMatchesTrace commit_before_append_ids:IdsConsecutive \
               ignore_append_error:AllowIsDurable no_tick:StampsIncrease \
-              no_mutex:CallsDoNotCollide record_unknown_slot:DenyRecordsNothing; do
+              no_mutex:CallsDoNotCollide record_unknown_slot:DenyRecordsNothing \
+              row_before_blob:RowsNameStoredBlobs; do
     m=${pair%%:*}; rule=${pair##*:}
     tlc "mutant-$m" "mutants/$m.cfg"
     if grep -q "Invariant $rule is violated" "$OUT/mutant-$m.log"; then
@@ -155,8 +163,8 @@ if [ "$want_code" = 1 ]; then
     row "FAIL  code: adapter::tests::failed_append_keeps_the_old_state (log $OUT/cargo-lib.log)"
   fi
   if cargo test -p coordinator --test admission_durability --offline --locked >"$OUT/cargo-admission.log" 2>&1 \
-     && grep -q "test result: ok. 4 passed" "$OUT/cargo-admission.log"; then
-    row "PASS  code: tests/admission_durability.rs (4 tests)"
+     && grep -q "test result: ok. 6 passed" "$OUT/cargo-admission.log"; then
+    row "PASS  code: tests/admission_durability.rs (6 tests)"
   else
     fail=1
     row "FAIL  code: tests/admission_durability.rs: $(grep -E '^test .* FAILED|^error' "$OUT/cargo-admission.log" | head -3 | tr '\n' ' ')(log $OUT/cargo-admission.log)"

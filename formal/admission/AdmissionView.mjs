@@ -13,7 +13,11 @@ const callState = (v, k) => {
       return "Holds the lock, deciding on a copy";
     case "early_commit":
     case "stepped":
-      return "Decided, about to write the event";
+      return "Decided, about to store the tool input";
+    case "blob_stored":
+      return "Tool input stored, about to write the event";
+    case "row_written":
+      return "Event written before its tool input (broken variant)";
     case "to_commit":
       return "Event written, state not yet advanced";
     case "committed":
@@ -21,7 +25,7 @@ const callState = (v, k) => {
     case "returned":
       return "Lock freed, reply on its way";
     case "failed":
-      return "Write failed, lock freed, state unchanged";
+      return "Store or write failed, lock freed, state unchanged";
     case "done":
       return v.reply[k] === "Err"
         ? "Shim got an error"
@@ -48,10 +52,14 @@ export const step = (action) => {
       return "the call takes the lock";
     case "Step":
       return "the core decides on a copy of the state";
+    case "BlobOk":
+      return "the tool input is stored and flushed";
+    case "BlobFails":
+      return "storing the tool input fails";
     case "AppendOk":
       return "the event is written to the trace";
     case "AppendFails":
-      return "the write to the trace fails";
+      return "the write to the trace fails, leaving the stored tool input unused";
     case "AppendIdClash":
       return "the write clashes with the other call's event";
     case "NoRecord":

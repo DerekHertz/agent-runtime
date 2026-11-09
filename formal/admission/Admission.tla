@@ -11,8 +11,11 @@
 (*                                                                         *)
 (*   Lock          let mut inner = self.inner.lock()                       *)
 (*   Step          core::step(inner.state.clone(), BeforeTool(call), now)  *)
-(*   AppendOk      inner.trace.append(&event)  returned Ok                 *)
-(*   AppendFails   inner.trace.append(&event)? returned Err                *)
+(*   BlobOk        inside TraceWriter::append: self.blobs.put(tool_input)  *)
+(*                 returned Ok (the blob is flushed)                       *)
+(*   BlobFails     the same put returned Err: no row is inserted           *)
+(*   AppendOk      the INSERT inside TraceWriter::append returned Ok       *)
+(*   AppendFails   the INSERT returned Err (the blob stays, an orphan)     *)
 (*   NoRecord      the core emitted no Record (unknown slot)               *)
 (*   Commit        inner.state = next                                      *)
 (*   Unlock        the guard drops as before_tool returns Ok(admission)    *)
@@ -25,6 +28,7 @@ EXTENDS Naturals, Sequences, FiniteSets
 
 CONSTANTS
     Calls,       \* the calls in flight (two): each one a call of before_tool
+    Payloads,    \* the raw tool inputs a call may carry (calls may share one)
     Slots,       \* the slots of the run
     WithGhost,   \* TRUE: a call may name a slot that is not in the run
     Mutation     \* "none", or the name of a deliberately broken variant
@@ -34,6 +38,8 @@ AllSlots == IF WithGhost THEN Slots \cup {Ghost} ELSE Slots
 
 VARIABLES
     slotOf,    \* [Calls -> AllSlots]: the slot each call names (never changes)
+    payloadOf, \* [Calls -> Payloads]: the raw tool input of each call (never changes)
+    blobs,     \* SUBSET Payloads: the blobs stored and flushed in runs/<id>/blobs/
     pc,        \* [Calls -> string]: where each call is inside before_tool
     holder,    \* SUBSET Calls: who holds the lock on `inner` ({} = free)
     nextId,    \* inner.state.next_event_id: the committed core state
@@ -43,7 +49,7 @@ VARIABLES
     reply,     \* [Calls -> string]: what the shim got back
     injected   \* SUBSET Calls: calls whose append the environment made fail
 
-vars == <<slotOf, pc, holder, nextId, clk, out, trace, reply, injected>>
+vars == <<slotOf, payloadOf, blobs, pc, holder, nextId, clk, out, trace, reply, injected>>
 
 NoOut == [has |-> FALSE, id |-> 0, slot |-> "-", stamp |-> 0,
           nid |-> 0, nclk |-> [s \in Slots |-> 0], verdict |-> "-"]
@@ -53,13 +59,15 @@ TraceIds == {trace[i].id : i \in DOMAIN trace}
 (* A call is inside the critical section from the first line after lock()  *)
 (* up to and including `inner.state = next`. Outside it the committed      *)
 (* state and the trace must agree.                                         *)
-InCritical(k) == pc[k] \in {"locked", "stepped", "early_commit",
-                            "to_commit", "committed"}
+InCritical(k) == pc[k] \in {"locked", "stepped", "early_commit", "blob_stored",
+                            "row_written", "to_commit", "committed"}
 Quiet == \A k \in Calls : ~InCritical(k)
 
 -----------------------------------------------------------------------------
 Init ==
     /\ slotOf \in [Calls -> AllSlots]
+    /\ payloadOf \in [Calls -> Payloads]
+    /\ blobs = {}                        \* a new run's blobs/ is empty
     /\ pc = [k \in Calls |-> "new"]
     /\ holder = {}
     /\ nextId = 1                        \* State::new: event ids start at 1
@@ -75,7 +83,7 @@ Lock(k) ==
     /\ (Mutation = "no_mutex" \/ holder = {})
     /\ holder' = holder \cup {k}
     /\ pc' = [pc EXCEPT ![k] = "locked"]
-    /\ UNCHANGED <<slotOf, nextId, clk, out, trace, reply, injected>>
+    /\ UNCHANGED <<slotOf, payloadOf, blobs, nextId, clk, out, trace, reply, injected>>
 
 (* `core::step(inner.state.clone(), ...)`: works on a copy. A known slot    *)
 (* gets the next event id and its clock ticked (clock rule 1); an unknown   *)
@@ -99,7 +107,7 @@ Step(k) ==
     /\ pc' = [pc EXCEPT ![k] =
                 IF Mutation = "commit_before_append" THEN "early_commit"
                 ELSE "stepped"]
-    /\ UNCHANGED <<slotOf, holder, nextId, clk, trace, reply, injected>>
+    /\ UNCHANGED <<slotOf, payloadOf, blobs, holder, nextId, clk, trace, reply, injected>>
 
 (* Only in the broken variant "commit_before_append": `inner.state = next`  *)
 (* moved above the append loop.                                             *)
@@ -109,54 +117,88 @@ EarlyCommit(k) ==
     /\ nextId' = out[k].nid
     /\ clk' = out[k].nclk
     /\ pc' = [pc EXCEPT ![k] = "stepped"]
-    /\ UNCHANGED <<slotOf, holder, out, trace, reply, injected>>
+    /\ UNCHANGED <<slotOf, payloadOf, blobs, holder, out, trace, reply, injected>>
 
 AfterAppend == IF Mutation = "commit_before_append" THEN "committed"
                ELSE "to_commit"
 
-(* `inner.trace.append(&event)` returned Ok: one row, durable. The id is    *)
-(* the primary key, so a row with that id already there makes it fail.      *)
+(* TraceWriter::append stores the payload blob, then inserts the row. The   *)
+(* broken variant "row_before_blob" swaps the two.                          *)
+RowFirst == Mutation = "row_before_blob"
+BlobFrom == IF RowFirst THEN "row_written" ELSE "stepped"
+AfterBlob == IF RowFirst THEN AfterAppend ELSE "blob_stored"
+RowFrom == IF RowFirst THEN "stepped" ELSE "blob_stored"
+AfterRow == IF RowFirst THEN "row_written" ELSE AfterAppend
+
+(* `self.blobs.put(tool_input)` returned Ok: the blob is in blobs/ and      *)
+(* flushed. Equal payloads share one blob (a set).                          *)
+BlobOk(k) ==
+    /\ pc[k] = BlobFrom
+    /\ out[k].has
+    /\ blobs' = blobs \cup {payloadOf[k]}
+    /\ pc' = [pc EXCEPT ![k] = AfterBlob]
+    /\ UNCHANGED <<slotOf, payloadOf, holder, nextId, clk, out, trace, reply, injected>>
+
+(* The put failed (a full disk, a read-only blobs/; the test makes blobs/   *)
+(* read-only). No blob counts as stored and no row is inserted; `?` returns *)
+(* Err, the guard drops, the state stays. Under "ignore_append_error" the   *)
+(* error is dropped like any other append error.                            *)
+BlobFails(k) ==
+    /\ pc[k] = BlobFrom
+    /\ out[k].has
+    /\ injected' = injected \cup {k}
+    /\ IF Mutation = "ignore_append_error"
+       THEN /\ pc' = [pc EXCEPT ![k] = AfterBlob]
+            /\ UNCHANGED holder
+       ELSE /\ pc' = [pc EXCEPT ![k] = "failed"]
+            /\ holder' = holder \ {k}
+    /\ UNCHANGED <<slotOf, payloadOf, blobs, nextId, clk, out, trace, reply>>
+
+(* The INSERT returned Ok: one row, durable, naming the call's blob. The id *)
+(* is the primary key, so a row with that id already there makes it fail.   *)
 AppendOk(k) ==
-    /\ pc[k] = "stepped"
+    /\ pc[k] = RowFrom
     /\ out[k].has
     /\ out[k].id \notin TraceIds
     /\ trace' = Append(trace, [id |-> out[k].id, slot |-> out[k].slot,
-                               stamp |-> out[k].stamp, call |-> k])
-    /\ pc' = [pc EXCEPT ![k] = AfterAppend]
-    /\ UNCHANGED <<slotOf, holder, nextId, clk, out, reply, injected>>
+                               stamp |-> out[k].stamp, call |-> k,
+                               blob |-> payloadOf[k]])
+    /\ pc' = [pc EXCEPT ![k] = AfterRow]
+    /\ UNCHANGED <<slotOf, payloadOf, blobs, holder, nextId, clk, out, reply, injected>>
 
-(* The append fails for a reason outside the coordinator (the test plants   *)
-(* a conflicting row; a disk error would do the same). Nothing is written.  *)
+(* The INSERT fails for a reason outside the coordinator (the test plants a *)
+(* conflicting row; a disk error would do the same). No row is written; a   *)
+(* blob already stored stays as an orphan that no row names.                *)
 (* Baseline: `?` returns Err and the guard drops, the state stays.          *)
 (* Broken variant "ignore_append_error": the error is dropped and the call  *)
 (* carries on to commit and Allow.                                          *)
 AppendFails(k) ==
-    /\ pc[k] = "stepped"
+    /\ pc[k] = RowFrom
     /\ out[k].has
     /\ injected' = injected \cup {k}
     /\ IF Mutation = "ignore_append_error"
-       THEN /\ pc' = [pc EXCEPT ![k] = AfterAppend]
+       THEN /\ pc' = [pc EXCEPT ![k] = AfterRow]
             /\ UNCHANGED holder
        ELSE /\ pc' = [pc EXCEPT ![k] = "failed"]
             /\ holder' = holder \ {k}
-    /\ UNCHANGED <<slotOf, nextId, clk, out, trace, reply>>
+    /\ UNCHANGED <<slotOf, payloadOf, blobs, nextId, clk, out, trace, reply>>
 
 (* The id is already a row: only possible when the two calls are not        *)
 (* serialized (Mutation = "no_mutex"). The primary key refuses the row.     *)
 AppendIdClash(k) ==
-    /\ pc[k] = "stepped"
+    /\ pc[k] = RowFrom
     /\ out[k].has
     /\ out[k].id \in TraceIds
     /\ pc' = [pc EXCEPT ![k] = "failed"]
     /\ holder' = holder \ {k}
-    /\ UNCHANGED <<slotOf, nextId, clk, out, trace, reply, injected>>
+    /\ UNCHANGED <<slotOf, payloadOf, blobs, nextId, clk, out, trace, reply, injected>>
 
 (* The core emitted only an Admit: nothing to append. *)
 NoRecord(k) ==
     /\ pc[k] = "stepped"
     /\ ~out[k].has
     /\ pc' = [pc EXCEPT ![k] = AfterAppend]
-    /\ UNCHANGED <<slotOf, holder, nextId, clk, out, trace, reply, injected>>
+    /\ UNCHANGED <<slotOf, payloadOf, blobs, holder, nextId, clk, out, trace, reply, injected>>
 
 (* `inner.state = next`, after every output was performed. *)
 Commit(k) ==
@@ -164,14 +206,14 @@ Commit(k) ==
     /\ nextId' = out[k].nid
     /\ clk' = out[k].nclk
     /\ pc' = [pc EXCEPT ![k] = "committed"]
-    /\ UNCHANGED <<slotOf, holder, out, trace, reply, injected>>
+    /\ UNCHANGED <<slotOf, payloadOf, blobs, holder, out, trace, reply, injected>>
 
 (* The function returns Ok(admission): the guard drops, the lock is free. *)
 Unlock(k) ==
     /\ pc[k] = "committed"
     /\ holder' = holder \ {k}
     /\ pc' = [pc EXCEPT ![k] = "returned"]
-    /\ UNCHANGED <<slotOf, nextId, clk, out, trace, reply, injected>>
+    /\ UNCHANGED <<slotOf, payloadOf, blobs, nextId, clk, out, trace, reply, injected>>
 
 (* The tonic handler answers the shim; an Err becomes Status::internal.     *)
 Reply(k) ==
@@ -179,7 +221,7 @@ Reply(k) ==
     /\ reply' = [reply EXCEPT ![k] =
                    IF pc[k] = "failed" THEN "Err" ELSE out[k].verdict]
     /\ pc' = [pc EXCEPT ![k] = "done"]
-    /\ UNCHANGED <<slotOf, holder, nextId, clk, out, trace, injected>>
+    /\ UNCHANGED <<slotOf, payloadOf, blobs, holder, nextId, clk, out, trace, injected>>
 
 (* End state: both calls answered. Nothing changes; named so TLC does not   *)
 (* report the end as a deadlock.                                            *)
@@ -191,6 +233,8 @@ Next ==
     \/ \E k \in Calls : Lock(k)
     \/ \E k \in Calls : Step(k)
     \/ \E k \in Calls : EarlyCommit(k)
+    \/ \E k \in Calls : BlobOk(k)
+    \/ \E k \in Calls : BlobFails(k)
     \/ \E k \in Calls : AppendOk(k)
     \/ \E k \in Calls : AppendFails(k)
     \/ \E k \in Calls : AppendIdClash(k)
@@ -207,6 +251,8 @@ Spec == Init /\ [][Next]_vars
 
 TypeOK ==
     /\ slotOf \in [Calls -> AllSlots]
+    /\ payloadOf \in [Calls -> Payloads]
+    /\ blobs \subseteq Payloads
     /\ holder \subseteq Calls
     /\ nextId \in Nat
     /\ clk \in [Slots -> Nat]
@@ -243,6 +289,12 @@ StampsIncrease ==
     \A i, j \in DOMAIN trace :
         (i < j /\ trace[i].slot = trace[j].slot) => trace[i].stamp < trace[j].stamp
 
+(* (f) Every row names a blob that is stored and flushed: the blob is put   *)
+(* before its row, so no failure leaves a row without its blob. A blob that *)
+(* no row names (an orphan after a failed INSERT) is allowed.               *)
+RowsNameStoredBlobs ==
+    \A i \in DOMAIN trace : trace[i].blob \in blobs
+
 (* (e) What the mutex buys: two calls never make each other fail. A call    *)
 (* gets an Err only when its own append failed for an outside reason.       *)
 CallsDoNotCollide ==
@@ -262,5 +314,16 @@ RetryReusesIdAndStamp ==
              /\ trace[i].id = out[k1].id
              /\ trace[i].stamp = out[k1].stamp
 WitnessNotReached == ~RetryReusesIdAndStamp
+
+(* A second witness, expected to be VIOLATED: a call stored its blob, its   *)
+(* INSERT failed, and no row names that blob, which rule (f) allows. Its    *)
+(* violation shows the model reaches the orphan case, so (f) is not proved  *)
+(* only because blobs never outlive a failure.                              *)
+OrphanBlobReached ==
+    \E k \in Calls :
+        /\ reply[k] = "Err"
+        /\ payloadOf[k] \in blobs
+        /\ \A i \in DOMAIN trace : trace[i].blob # payloadOf[k]
+OrphanNotReached == ~OrphanBlobReached
 
 =============================================================================
