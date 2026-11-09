@@ -54,6 +54,9 @@ An admission that holds the call until the lease frees up, or until a timeout tu
 **Release**:
 The moment an agent gives up a lease. Other agents' current views of a file it changed become Invalid.
 
+**Released version**:
+A file's content as of its last release. An agent that reads a file someone else holds the lease on sees the released version, not the work in progress.
+
 **Invalid / Shared / Owned**:
 An agent's standing toward one file. **Invalid** means it hasn't read the current version. **Shared** means it has read the current version. **Owned** means it holds the lease. An agent must re-read an Invalid file before it may take the lease.
 _Avoid_: stale, fresh, locked

@@ -119,7 +119,9 @@ Until M3, Deny or Defer is a single setting for the whole run, with Deny as the 
 
 A failing release command keeps the lease. Release with changes invalidates every other agent's Shared copy of that file. The next read by any of them is served fresh and stamped with the writer's clock, which is what makes the causal trace meaningful.
 
-**Consistency model.** v1 guarantees one writer per file at a time, with invalidation at release. It does *not* provide release consistency: all agents share one tree, so an owner's in-progress edits can be read and built by other agents as soon as they are on disk. That cost is measured in the trace, for example builds failing on another agent's half-finished file. If it turns out to be large, private trees per agent with publication at release are the next step. See [ADR 0001](adr/0001-shared-tree-single-writer-leases.md).
+**Reads of a leased file.** When an agent calls `Read` on a file another agent holds the lease on, the shim rewrites the call with `updatedInput` to point at the coordinator's snapshot of the file's last released version. The reader never sees half-done work and never waits. If M0 shows that `updatedInput` can't redirect a Read, the fallback is the run's Deny-or-Defer setting.
+
+**Consistency model.** v1 guarantees one writer per file at a time, with invalidation at release. It does *not* provide release consistency: all agents share one tree, so builds and tests by other agents see an owner's in-progress edits as soon as they are on disk. The `Read` tool does not, because it is served the last released version. That cost is measured in the trace, for example builds failing on another agent's half-finished file. If it turns out to be large, private trees per agent with publication at release are the next step. See [ADR 0001](adr/0001-shared-tree-single-writer-leases.md).
 
 **Granularity escalation (v2).** When two agents repeatedly contend for the same large file, the coordinator can split the lease to symbol level using tree-sitter: ownership of `fn parse_header` rather than `src/parser.rs`. Writes outside the owned span are rejected. Symbol-level leases coexist with file-level ones under a simple rule: a file lease excludes all symbol leases in that file and vice versa.
 
@@ -135,11 +137,13 @@ Every hook event carries a vector clock, so the trace store can answer "did agen
 
 1. On each event from a slot, increment that slot's own entry and stamp the event with the slot's full vector.
 2. Merge another vector into a slot's clock (element-wise max) **only** through a knowledge channel:
-   - **Read:** the reader absorbs the file's clock. *(Which clock, last write or last release, is open: grill round 3, Q15.)*
+   - **Read:** the reader absorbs the file's **release clock**. A `Read` of a file someone else holds the lease on is served the last released version (section 4), so the reader learns only what was released.
    - **Whole-tree read:** a read-only Bash command that reads the whole tree (section 7) absorbs every file's latest-write clock. It does not change any file's Invalid/Shared standing, because only the `Read` tool does that.
    - **Deny:** the denied agent absorbs the lease holder's clock from when it took the lease.
    - **Barrier:** every participant absorbs every other participant's clock.
 3. Nothing else merges. The coordinator is not a clock participant, and it never sends a global merged view back to an agent.
+
+Each file carries two clocks: the **release clock**, set at each release with changes and picked up by `Read`, and the **latest-write clock**, set on every write and picked up by builds and tests.
 
 This is what ties coherence and causality together: reading a file that agent A changed makes A's write happen-before everything you do next, and nothing else does. See [ADR 0002](adr/0002-explicit-knowledge-channels.md).
 
@@ -200,8 +204,8 @@ All inter-process communication is gRPC over tonic, with two services: one the s
 service Coordinator {
   // Hook path, called by every agent's shim
   rpc BeforeTool(BeforeToolRequest) returns (Admission);
-  rpc AfterTool(AfterToolReport) returns (ClockUpdate);
-  rpc Release(ReleaseRequest) returns (ClockUpdate);
+  rpc AfterTool(AfterToolReport) returns (Ack);
+  rpc Release(ReleaseRequest) returns (Ack);
   // Bidirectional stream so the coordinator can push invalidations and barrier releases
   rpc Attach(stream AgentEvent) returns (stream CoordinatorEvent);
 }
@@ -213,10 +217,11 @@ service Orchestration {
   rpc AllReduce(AllReduceRequest) returns (AllReduceResult);
 }
 
+// No clocks in shim-facing messages: the coordinator holds every slot's clock (section 5).
 message BeforeToolRequest {
-  string agent_id = 1;
-  bytes vclock = 2;
-  string tool = 3;           // Edit, Write, Bash, ...
+  string slot = 1;
+  string session_id = 2;
+  string tool = 3;           // Edit, Write, NotebookEdit, Read, Bash
   string tool_input_json = 4; // raw hook tool_input; the coordinator core classifies it (paths, Bash class)
   string intent = 5;          // Bash `description` when present, else empty; agents are never prompted for it
 }
@@ -226,7 +231,7 @@ message Admission {
   Verdict verdict = 1;
   string reason = 2;
   string owner = 3;
-  bytes vclock = 4;
+  string updated_input_json = 4; // set when a Read is redirected to a released snapshot
 }
 ```
 

@@ -10,3 +10,7 @@ All agents in a run edit one shared working tree. The coordinator only admits or
 ## Consequences
 
 Builds and tests can fail on another agent's half-finished edit. That's a cost to measure in the M2 trace, not a bug. If it turns out to be frequent, revisit with the private-tree option.
+
+## Amendment (grill round 3): reads of a leased file see the released version
+
+A `Read` of a file another agent holds the lease on is redirected (via the PreToolUse `updatedInput`) to the coordinator's snapshot of the file's last released version. We chose this over blocking the read because Anthropic's multi-agent write-ups favour isolation and short locks over long blocking, and lockouts showed up as a failure mode (anthropic.com/research/multiagent-systems, /building-c-compiler). Builds and tests still see the shared tree. If M0 shows `updatedInput` cannot redirect a Read, fall back to Defer, then Deny.
