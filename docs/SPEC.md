@@ -105,9 +105,19 @@ The coordinator enforces Invalid itself. The model's context can't be cleared, a
 **Acquire.** On PreToolUse for any write tool, the shim sends `Acquire(path, agent, clock)`. The coordinator grants if no other agent holds Owned, otherwise returns one of:
 
 - `Deny(owner, reason)`: the agent is told who owns the file and what they are doing (the owner's declared intent string, if any). Claude Code surfaces this as the tool's error, and the model chooses another task or waits.
-- `Defer(ticket)`: the shim blocks the tool call until the lease is released, up to a configurable timeout (default 60 s). Used when the orchestrator has marked the agents as cooperating on a phase.
+- `Defer(ticket)`: the shim blocks the tool call until the lease is released, up to a configurable timeout (default 60 s). A Defer that times out becomes a Deny.
 
-**Release.** A lease is released when the owning agent runs a PostToolUse on a test or build command that succeeds, when it emits an explicit `Release`, when its session ends, or when a lease TTL expires (default 10 min, renewed on each write). Release with changes invalidates every other agent's Shared copy of that file. The next read by any of them is served fresh and stamped with the writer's clock, which is what makes the causal trace meaningful.
+Until M3, Deny or Defer is a single setting for the whole run, with Deny as the default. M3 adds choosing it per phase. A Deny reason names the slot holding the lease, that agent's stated intent, and how long it has held the lease.
+
+**Release.** A lease is released on any of six triggers:
+1. the owning agent's Stop (it finished its turn);
+2. its SessionEnd;
+3. the lease's time limit running out (default 10 min, renewed on each write);
+4. a barrier (section 6);
+5. an explicit `art release`, kept for testing and never prompted, to keep the transparency goal;
+6. a Bash command on the run's configured release list (e.g. `cargo test`, `cargo build`) exiting 0.
+
+A failing release command keeps the lease. Release with changes invalidates every other agent's Shared copy of that file. The next read by any of them is served fresh and stamped with the writer's clock, which is what makes the causal trace meaningful.
 
 **Consistency model.** v1 guarantees one writer per file at a time, with invalidation at release. It does *not* provide release consistency: all agents share one tree, so an owner's in-progress edits can be read and built by other agents as soon as they are on disk. That cost is measured in the trace, for example builds failing on another agent's half-finished file. If it turns out to be large, private trees per agent with publication at release are the next step. See [ADR 0001](adr/0001-shared-tree-single-writer-leases.md).
 
@@ -125,7 +135,8 @@ Every hook event carries a vector clock, so the trace store can answer "did agen
 
 1. On each event from a slot, increment that slot's own entry and stamp the event with the slot's full vector.
 2. Merge another vector into a slot's clock (element-wise max) **only** through a knowledge channel:
-   - **Read:** the reader absorbs the file's clock.
+   - **Read:** the reader absorbs the file's clock. *(Which clock, last write or last release, is open: grill round 3, Q15.)*
+   - **Whole-tree read:** a read-only Bash command that reads the whole tree (section 7) absorbs every file's latest-write clock. It does not change any file's Invalid/Shared standing, because only the `Read` tool does that.
    - **Deny:** the denied agent absorbs the lease holder's clock from when it took the lease.
    - **Barrier:** every participant absorbs every other participant's clock.
 3. Nothing else merges. The coordinator is not a clock participant, and it never sends a global merged view back to an agent.
@@ -221,7 +232,13 @@ message Admission {
 
 **Remote tool invocation.** Tools that agents call but that live outside the agent process (the test runner, a shared build cache, the city sim's headless shards later) are exposed as gRPC services with generated stubs. The shim rewrites a local tool call into a remote call transparently. This is the RMI-shaped part: a stub, a skeleton, serialization, and a registry, with the registry being the coordinator. It is also the natural seam if the runtime ever spans machines.
 
-**Path extraction.** For Edit and Write the paths are explicit in the tool input. For Bash the shim runs a conservative static scan of the command for file arguments and redirections; anything it cannot classify is treated as touching the whole tree, which forces the agent to hold a global lease. That is intentionally strict and should be loosened only with evidence from the trace.
+**Path extraction.** For Edit, Write and NotebookEdit the paths are explicit in the tool input. Bash commands fall into three classes, with the lists set per run in config:
+
+- **Read-only** (e.g. `cargo test/build/check/clippy`, `git status/diff/log`, `ls`, `cat`, `grep`, `rg`, `find`): no lease needed. Build and test commands count as whole-tree reads for clocks (section 5).
+- **Writes to known paths** (e.g. `mv`, `cp`, `rm`, `sed -i`, `>` redirects to a file): a lease on each path.
+- **Unknown:** a whole-tree lease, which conflicts with every other lease. This is deliberately strict, and should be loosened only with evidence from the trace.
+
+`target/` and `.git/` are not covered by leases.
 
 ---
 
@@ -254,8 +271,17 @@ The honest expectation is that leases trade some idle time for far fewer conflic
 
 ## 9. Milestones
 
-Six milestones, each ending in something a coding agent can verify by running it; from M3 onward the runtime builds itself, and from M5 it builds the city simulator.
+An M0 spike followed by six milestones, each ending in something a coding agent can verify by running it; from M3 onward the runtime builds itself, and from M5 it builds the city simulator.
 
+0. **M0: Hook probe (no Rust).** Two `claude -p --model haiku` sessions run on a toy repo, using the subscription (no `--bare`, no `ANTHROPIC_API_KEY`). A shell hook logs its stdin and can be told to sleep or deny. It measures six things:
+   1. whether launcher-set environment variables reach the hook;
+   2. whether a 60 s hook block degrades the session;
+   3. whether a hook timeout lets the call through;
+   4. whether parallel tool calls run their PreToolUse hooks at the same time;
+   5. whether the cap of 8 consecutive Stop-hook continuations holds;
+   6. how the model behaves after a Deny.
+
+   *Done when:* `docs/research/m0-hook-probe.md` answers all six with logs.
 1. **M1: Hook shim and trace (no coherence yet).** A Rust shim binary registered as Claude Code hooks, plus a minimal coordinator that allows every call, holds the clocks and is the only process that writes the SQLite trace. Shims keep no state. Two agents run on a toy repo; the store can answer `happens_before` for any pair.
    *Done when:* a concurrent-write pair is detected in a deliberately conflicting run.
 2. **M2: File leases.** Coordinator with Acquire/Release/Deny/Defer and invalidation.
@@ -275,9 +301,9 @@ Milestones 1 through 4 are the resume deliverable on their own. M5 and M6 are wh
 
 ## 10. Open questions and risks
 
-- [ ] **Hook latency budget.** Claude Code runs hooks synchronously; if a Defer blocks for 60 s, does the session time out or degrade? Measure in M1 before committing to Defer semantics.
+- [ ] **Hook latency budget.** Claude Code runs hooks synchronously; if a Defer blocks for 60 s, does the session time out or degrade? Measured in M0. The hook timeout is set to the Defer timeout plus 30 s (section 3).
 - [ ] **Bash path extraction.** The conservative "touch everything" fallback may make Bash-heavy agents hold global leases constantly. Need trace data from M2 to decide how much static analysis is worth.
-- [ ] **Agent behavior on Deny.** Does the model retry the same edit, pick another task, or stall? If it stalls, the orchestrator needs a nudge mechanism, which is scope creep worth resisting.
+- [ ] **Agent behavior on Deny.** Does the model retry the same edit, pick another task, or stall? First look in M0. If it stalls, the orchestrator needs a nudge mechanism, which is scope creep worth resisting.
 - [x] **Clock identity across sessions.** Resolved: clocks are keyed by a run-scoped slot that the launcher assigns through environment variables. The coordinator maps `session_id` to slot (section 3).
 - [ ] **Own-loop adapter priority.** It is cleaner but delays dogfooding. Current call: hooks first, own loop only if hooks prove too constraining by M2.
 - [ ] **Benchmark repository.** Needs enough parallelizable work for 10 agents and a fast test suite. The city sim itself is the candidate once M5 exists; before that, a mid-size open-source Rust crate.

@@ -39,6 +39,9 @@ _Avoid_: workspace, repo (when you mean the working files)
 An agent's exclusive right to write a file. At most one agent holds a lease on a given file at a time.
 _Avoid_: lock, ownership
 
+**Whole-tree lease**:
+A lease on every file at once, required by a command whose writes can't be pinned to paths. It conflicts with every other lease.
+
 **Admission**:
 The coordinator's verdict on a proposed tool call: Allow, Deny, or Defer.
 
@@ -65,4 +68,4 @@ A vector with one counter per slot, showing everything the stamped event could h
 _Avoid_: timestamp (wall time is for display only)
 
 **Knowledge channel**:
-One of the few ways one agent's clock can absorb another's: reading a file, being denied by a lease holder, or passing a barrier. Nothing else carries knowledge between agents.
+One of the few ways one agent's clock can absorb another's: reading a file, building or testing the whole tree, being denied by a lease holder, or passing a barrier. Nothing else carries knowledge between agents.
