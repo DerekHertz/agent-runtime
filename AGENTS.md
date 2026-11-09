@@ -38,6 +38,8 @@ Before implementation or review, read `.agents/memory/MEMORY.md` and relevant to
 
 For every PR, follow pstack's `poteto-mode` Opening a PR playbook. Apply `technical-writing` and then `unslop` to the title, description, and commit body. Use a Conventional Commit title and a one-minute description with `## Why`, `## What changed`, `## Scope`, optional `## Tradeoffs`, `## Blast Radius`, and `## Verification`, in that order. Keep the body under about 40 lines; link detailed evidence instead of pasting execution history.
 
+Keep each PR small enough to review in one sitting. Stack PRs only when a later one truly depends on an earlier one; otherwise open them independently against `main`.
+
 1. Claude implements the requested change and runs relevant project checks.
 2. Codex independently reviews the entire task diff and surrounding code without editing files. Findings must include location, trigger, impact, and evidence, checking the spec, ADRs, and shared lessons.
 3. Claude verifies findings, repairs confirmed issues, explains rejected findings with evidence, and reruns relevant checks.
@@ -47,3 +49,7 @@ For every PR, follow pstack's `poteto-mode` Opening a PR playbook. Apply `techni
 Never run Claude and Codex as concurrent writers in the same checkout. Use separate outputs or isolated checkouts for parallel implementers. Preserve unrelated user changes. No automatic commits, pushes, GitHub comments, merges, hosted services, or global settings changes without separate authorization.
 
 The current base branch is `main`; verify the task's actual base before branch review. The root Cargo workspace (`crates/`) builds with `cargo build --workspace` and tests with `cargo test --workspace` (add `--locked --offline` when the sandbox blocks crates.io). The Unix-socket tests in `crates/coordinator` and `crates/shim` must run where binding a Unix socket is allowed; see `.agents/memory/unix-socket-tests-need-local-binding.md`. Also run the issue's acceptance checks. `bench/toy` is a separate fixture crate whose `mean_works` test fails by design (seeded bug for agents to fix). Milestone completion requires its spec's Done when check.
+
+## Dogfooding records
+
+Record every dogfooding run in `docs/research/dogfooding.md`. A comparison needs two conditions on the same workload: a runtime-disabled control and a runtime-enabled run. Label each row as a simulated fixture (scripted binaries, recorded hook JSON, verification journeys) or an actual live coding run (real agent sessions). Mark anything not executed `not run`, and never fill a result you did not observe.

@@ -1,6 +1,6 @@
 //! End-to-end tests of the `art-shim` binary against a fake coordinator on a real Unix socket.
 
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
@@ -34,12 +34,14 @@ fn run_shim(slot: Option<&str>, socket: Option<&Path>, stdin: &str) -> Output {
         cmd.env("AGENT_RUNTIME_SOCKET", socket);
     }
     let mut child = cmd.spawn().expect("spawn art-shim");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(stdin.as_bytes())
-        .expect("write stdin");
+    // The shim exits before reading stdin when it is not in a run or its configuration is bad,
+    // so the write can race its exit. A broken pipe is that race; the caller still checks the
+    // exit code and output.
+    match child.stdin.take().unwrap().write_all(stdin.as_bytes()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::BrokenPipe => {}
+        Err(e) => panic!("write stdin: {e}"),
+    }
     child.wait_with_output().expect("wait for art-shim")
 }
 
