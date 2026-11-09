@@ -97,10 +97,8 @@ impl Clock {
         if !bytes.len().is_multiple_of(8) {
             return Err(DecodeError { len: bytes.len() });
         }
-        let entries = bytes
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().expect("chunk is 8 bytes")))
-            .collect();
+        let (chunks, _) = bytes.as_chunks::<8>();
+        let entries = chunks.iter().map(|c| u64::from_le_bytes(*c)).collect();
         Ok(Self { entries })
     }
 }
