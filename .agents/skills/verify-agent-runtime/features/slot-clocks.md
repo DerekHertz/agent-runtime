@@ -20,12 +20,14 @@ Preconditions:
 - `verify.py doctor` passes.
 - Coordinator running for empty run `r1` with slots `slot-1,slot-2`.
 
-- **Three calls.** Run `verify.py drive slot-clocks`. Edit fixture as `slot-1`, Bash fixture as `slot-2`, Edit fixture as `slot-1`. Each exits `0` with the allow decision.
+- **Three calls.** Run `verify.py drive slot-clocks`. Edit fixture as `slot-1`, Bash fixture as `slot-2`, then the Edit fixture as `slot-1` again with its `tool_use_id` changed to `toolu_verify_edit_again` (a second call with the same input). Each exits `0` with the allow decision.
 - **Ids and clocks.** Read `trace.db`: `event_id` is `1,2,3`; `agent_id` is `slot-1,slot-2,slot-1`; `vclock` is `[1,0]`, `[0,1]`, `[2,0]`.
 - **Bash row.** Row 2 has `tool=Bash`, and the blob its `payload_hash` names is byte-identical to the Bash fixture's raw `tool_input`.
 - **Deduplication.** Rows 1 and 3 have the same `payload_hash`, which differs from row 2's. `runs/r1/blobs/` holds exactly those two files and no temporary file.
 
 ## Gotchas
+
+- The repeated Edit needs its own `tool_use_id`. Sending the fixture unchanged twice repeats one call, which the coordinator refuses (see [call identity](./call-identity.md)).
 
 - No merging happens between slots yet (no reads, leases or collectives in this slice), so the other slot's entry stays 0. When merge-on-read lands, this journey's expected clocks change and must be updated deliberately.
 - The Bash `intent` (the `description` field) is not stored in the trace in this slice; do not assert on it.

@@ -119,13 +119,28 @@ if [ "$want_model" = 1 ]; then
     fail=1
     row "FAIL  orphan witness: the orphan case rule (f) allows is not reachable (log $OUT/orphan-witness.log)"
   fi
+  tlc identity-witness AdmissionIdentityWitness.cfg
+  if grep -q "Invariant IdentityRefusalNotReached is violated" "$OUT/identity-witness.log"; then
+    row "PASS  identity witness: the model reaches 'a known slot's call refused for its identity' ($(path_of "$OUT/identity-witness.log"))"
+  else
+    fail=1
+    row "FAIL  identity witness: no identity refusal is reachable, so rule (g) would be vacuous (log $OUT/identity-witness.log)"
+  fi
+  tlc retry-identity-witness AdmissionRetryIdentityWitness.cfg
+  if grep -q "Invariant FailedIdentityNotRetried is violated" "$OUT/retry-identity-witness.log"; then
+    row "PASS  retry identity witness: the model reaches 'a failed call retried with its session and tool_use_id and admitted' ($(path_of "$OUT/retry-identity-witness.log"))"
+  else
+    fail=1
+    row "FAIL  retry identity witness: the retry of a failed call's identity is not reachable (log $OUT/retry-identity-witness.log)"
+  fi
 
   # Each broken variant must be caught, by the rule named here (mutants/<variant>.cfg checks
   # that one rule alone, so every rule is seen to fail at least once).
   for pair in commit_before_append:CoreMatchesTrace commit_before_append_ids:IdsConsecutive \
               ignore_append_error:AllowIsDurable no_tick:StampsIncrease \
               no_mutex:CallsDoNotCollide record_unknown_slot:DenyRecordsNothing \
-              row_before_blob:RowsNameStoredBlobs; do
+              row_before_blob:RowsNameStoredBlobs no_binding_check:SessionStaysOnSlot \
+              no_repeat_check:CallRecordedOnce identity_before_append:CoreMatchesTrace; do
     m=${pair%%:*}; rule=${pair##*:}
     tlc "mutant-$m" "mutants/$m.cfg"
     if grep -q "Invariant $rule is violated" "$OUT/mutant-$m.log"; then
@@ -163,8 +178,8 @@ if [ "$want_code" = 1 ]; then
     row "FAIL  code: adapter::tests::failed_append_keeps_the_old_state (log $OUT/cargo-lib.log)"
   fi
   if cargo test -p coordinator --test admission_durability --offline --locked >"$OUT/cargo-admission.log" 2>&1 \
-     && grep -q "test result: ok. 6 passed" "$OUT/cargo-admission.log"; then
-    row "PASS  code: tests/admission_durability.rs (6 tests)"
+     && grep -q "test result: ok. 7 passed" "$OUT/cargo-admission.log"; then
+    row "PASS  code: tests/admission_durability.rs (7 tests)"
   else
     fail=1
     row "FAIL  code: tests/admission_durability.rs: $(grep -E '^test .* FAILED|^error' "$OUT/cargo-admission.log" | head -3 | tr '\n' ' ')(log $OUT/cargo-admission.log)"

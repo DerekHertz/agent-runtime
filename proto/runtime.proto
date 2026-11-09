@@ -19,6 +19,7 @@ message BeforeToolRequest {
   string tool = 3;            // Edit, Write, NotebookEdit, Read, Bash
   string tool_input_json = 4; // raw hook tool_input; the coordinator core classifies it (paths, Bash class)
   string intent = 5;          // Bash `description` when present, else empty; agents are never prompted for it
+  string tool_use_id = 6;     // hook tool_use_id; with session_id it names the call (pairs it with its AfterTool)
 }
 
 message Admission {

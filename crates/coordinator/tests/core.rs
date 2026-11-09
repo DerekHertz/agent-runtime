@@ -1,5 +1,7 @@
 //! The core is pure: these tests drive `step` with no tonic, no SQLite and no wall clock.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use clock::{Clock, Order};
 use coordinator::core::{
     step, Admission, BeforeTool, ConfigError, Input, Output, RunConfig, State, Verdict,
@@ -13,13 +15,21 @@ fn state(slots: &[&str]) -> State {
     .unwrap()
 }
 
+/// A call from `slot`'s session with its own `tool_use_id`, as Claude Code gives each call one.
 fn before(slot: &str, tool: &str) -> Input {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let id = format!("toolu_{}", NEXT.fetch_add(1, Ordering::Relaxed));
+    before_with_id(slot, tool, &id)
+}
+
+fn before_with_id(slot: &str, tool: &str, tool_use_id: &str) -> Input {
     Input::BeforeTool(BeforeTool {
         slot: slot.into(),
         session_id: format!("session-of-{slot}"),
         tool: tool.into(),
         tool_input_json: r#"{"file_path": "/work/src/lib.rs"}"#.into(),
         intent: String::new(),
+        tool_use_id: tool_use_id.into(),
     })
 }
 
@@ -60,7 +70,7 @@ fn first_event_of_a_slot_has_its_own_entry_at_one() {
 #[test]
 fn event_carries_slot_session_tool_kind_and_now() {
     let st = state(&["slot-1"]);
-    let (_, events, _) = run(st, before("slot-1", "Write"), 1_234_567);
+    let (_, events, _) = run(st, before_with_id("slot-1", "Write", "toolu_w"), 1_234_567);
     let e = &events[0];
     assert_eq!(e.kind, EventKind::BeforeTool);
     assert_eq!(e.slot, "slot-1");
@@ -74,6 +84,7 @@ fn event_carries_slot_session_tool_kind_and_now() {
         Some(r#"{"file_path": "/work/src/lib.rs"}"#)
     );
     assert_eq!(e.wall_time, 1_234_567);
+    assert_eq!(e.tool_use_id.as_deref(), Some("toolu_w"));
 }
 
 #[test]
@@ -137,8 +148,16 @@ fn unknown_slot_is_denied_and_state_is_unchanged() {
 
 #[test]
 fn step_is_deterministic() {
-    let a = run(state(&["slot-1", "slot-2"]), before("slot-2", "Edit"), 42);
-    let b = run(state(&["slot-1", "slot-2"]), before("slot-2", "Edit"), 42);
+    let a = run(
+        state(&["slot-1", "slot-2"]),
+        before_with_id("slot-2", "Edit", "toolu_d"),
+        42,
+    );
+    let b = run(
+        state(&["slot-1", "slot-2"]),
+        before_with_id("slot-2", "Edit", "toolu_d"),
+        42,
+    );
     assert_eq!(a.1, b.1);
     assert_eq!(a.2, b.2);
 }

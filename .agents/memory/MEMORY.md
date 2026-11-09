@@ -7,3 +7,4 @@ Project contracts live in AGENTS.md, docs/SPEC.md, GLOSSARY.md, and docs/adr/.
 - [Shim may exit before reading stdin](shim-may-exit-before-reading-stdin.md) — test helpers piping stdin must tolerate BrokenPipe only
 - [Directory existence is not durability](directory-existence-is-not-durability.md) — flush the full canonical chain to the filesystem anchor; concurrent creators may not have flushed
 - [Proto build uses protox](proto-build-uses-protox.md) — no system protoc; extend proto/runtime.proto only
+- [Test calls need unique tool_use_ids](test-calls-need-unique-tool-use-ids.md) — a repeated (session, tool_use_id) or a session on a second slot is denied; give each test call its own id

@@ -38,3 +38,4 @@ Each feature file starts with an H1 title and one paragraph describing the user-
 - [Unknown slot is denied](./unknown-slot.md) covers a slot outside the run: deny decision, nothing recorded.
 - [Slot clocks](./slot-clocks.md) covers per-slot counters and event ids across Edit and Bash calls from two slots, and one blob for repeated input.
 - [Hook input handling](./hook-input.md) covers non-PreToolUse events and malformed hook JSON.
+- [Call identity](./call-identity.md) covers session-to-slot binding, refusal of a repeated or rebound call, restarted sessions, equal `tool_use_id`s in two sessions, and overlapping calls.

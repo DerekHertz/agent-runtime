@@ -21,6 +21,7 @@ fn event(id: u64, tool_input: Option<&str>) -> Event {
         path: None,
         payload_hash: None,
         tool_input: tool_input.map(str::to_owned),
+        tool_use_id: Some(format!("toolu_{id}")),
         wall_time: 1_700_000_000_000,
     }
 }

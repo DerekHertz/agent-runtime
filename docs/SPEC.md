@@ -82,7 +82,7 @@ The **hook shim** is the only agent-facing code. On every PreToolUse for Edit, W
 
 **The shim fails closed.** Claude Code lets a tool call proceed when a hook times out or exits with an ordinary error. So if the shim cannot reach the coordinator, or fails internally, it denies the call (exit 2). A Defer must always finish inside the hook's configured timeout.
 
-**Slots and launching.** A launcher starts each session with environment variables naming its slot and the coordinator's socket, plus a settings file that registers the hooks. The coordinator maps each `session_id` to its slot, so a restarted session keeps its slot's clock. Without those variables the shim does nothing, so it never affects ordinary Claude Code sessions. The number of slots is fixed when a run starts.
+**Slots and launching.** A launcher starts each session with environment variables naming its slot and the coordinator's socket, plus a settings file that registers the hooks. The coordinator maps each `session_id` to its slot, so a restarted session keeps its slot's clock. A session's first recorded event binds it to its slot for the rest of the run; a call that names the session under a different slot is refused and recorded nowhere. Within a session, Claude Code's `tool_use_id` names one tool call, so the coordinator refuses a second BeforeTool for the same `(session_id, tool_use_id)`. Without those variables the shim does nothing, so it never affects ordinary Claude Code sessions. The number of slots is fixed when a run starts.
 
 The **own-loop adapter** implements the same two calls (`BeforeTool`, `AfterTool`) from inside a Rust agent loop that calls the Claude API directly. Both adapters produce identical trace events, so the coordinator and viewer never know which one is running. The city simulator is built using this runtime, which is the dogfood path described under Milestones.
 
@@ -158,6 +158,7 @@ This is what ties coherence and causality together: reading a file that agent A 
 | tool         | string | Edit, Write, Bash, Read, etc.                                                          |
 | path         | string | file or symbol, if any                                                                 |
 | payload_hash | bytes  | hash of the tool input or output; the full content lives in a blob store keyed by hash |
+| tool_use_id  | string | Claude Code's `tool_use_id` for tool events; with the session it pairs a BeforeTool with its AfterTool. Null in traces written before it existed |
 | wall_time    | i64    | for display only, never for ordering                                                   |
 
 **Layout.** Each run has its own directory, `runs/<run-id>/`, containing `trace.db` (SQLite, append-only, written only by the coordinator) and `blobs/` (content-addressed by blake3). Queries do not run in SQL. A run is loaded into memory (`Run::load(dir)`) and queried with pure methods. A later live-tail adapter will serve the viewer.
@@ -224,6 +225,7 @@ message BeforeToolRequest {
   string tool = 3;           // Edit, Write, NotebookEdit, Read, Bash
   string tool_input_json = 4; // raw hook tool_input; the coordinator core classifies it (paths, Bash class)
   string intent = 5;          // Bash `description` when present, else empty; agents are never prompted for it
+  string tool_use_id = 6;     // hook tool_use_id; with session_id it names the call (pairs it with its AfterTool)
 }
 
 message Admission {

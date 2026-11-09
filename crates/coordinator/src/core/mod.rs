@@ -7,6 +7,7 @@
 pub mod classification;
 pub mod clocks;
 pub mod defer;
+pub mod identity;
 pub mod leases;
 pub mod snapshots;
 
@@ -15,6 +16,7 @@ use std::collections::HashSet;
 use trace_store::{Event, EventKind};
 
 use clocks::Clocks;
+use identity::{Call, CallKey, Identities};
 
 /// The fixed set of slots a run is started with.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +56,7 @@ impl RunConfig {
 #[derive(Debug, Clone)]
 pub struct State {
     clocks: Clocks,
+    identities: Identities,
     next_event_id: u64,
 }
 
@@ -63,6 +66,7 @@ impl State {
         config.validate()?;
         Ok(Self {
             clocks: Clocks::new(&config.slots),
+            identities: Identities::default(),
             next_event_id: 1,
         })
     }
@@ -74,6 +78,16 @@ impl State {
     /// A slot's current clock, or `None` for a slot not in the run.
     pub fn clock(&self, slot: &str) -> Option<&clock::Clock> {
         self.clocks.get(slot)
+    }
+
+    /// The slot a session is bound to, or `None` before its first recorded event.
+    pub fn session_slot(&self, session_id: &str) -> Option<&str> {
+        self.identities.slot_of(session_id)
+    }
+
+    /// A recorded call, by its `(session_id, tool_use_id)`.
+    pub fn call(&self, key: &CallKey) -> Option<&Call> {
+        self.identities.call(key)
     }
 }
 
@@ -92,6 +106,8 @@ pub struct BeforeTool {
     /// The raw hook `tool_input`.
     pub tool_input_json: String,
     pub intent: String,
+    /// The hook `tool_use_id`, which names the call within its session.
+    pub tool_use_id: String,
 }
 
 /// An effect the adapter must carry out.
@@ -143,15 +159,37 @@ impl Admission {
 
 /// Advance the coordinator by one input at wall time `now` (milliseconds since the Unix epoch,
 /// display only). Returns the next state and the effects to perform, `Record`s before the `Admit`.
+///
+/// A refused call (unknown slot, empty or rebound session, empty or repeated `tool_use_id`) gets a
+/// Deny, no `Record`, and the state back unchanged. The adapter commits the returned state only
+/// after every `Record` is appended, so a failed append binds no session and uses no call identity.
 pub fn step(mut state: State, input: Input, now: i64) -> (State, Vec<Output>) {
     match input {
         Input::BeforeTool(call) => {
-            // Clock rule 1 only. Nothing merges here: ADR 0002, clocks cross only through
-            // knowledge channels.
-            let Some(stamp) = state.clocks.tick(&call.slot) else {
+            if state.clocks.get(&call.slot).is_none() {
                 let reason = format!("unknown slot {:?}: not part of this run", call.slot);
                 return (state, vec![Output::Admit(Admission::deny(reason))]);
+            }
+            let key = CallKey {
+                session_id: call.session_id.clone(),
+                tool_use_id: call.tool_use_id.clone(),
             };
+            let recorded = Call {
+                before_event_id: state.next_event_id,
+                tool: call.tool.clone(),
+            };
+            if let Err(refusal) = state.identities.record_before(&call.slot, key, recorded) {
+                return (
+                    state,
+                    vec![Output::Admit(Admission::deny(refusal.to_string()))],
+                );
+            }
+            // Clock rule 1 only. Nothing merges here: ADR 0002, clocks cross only through
+            // knowledge channels. A new session of a slot continues that slot's clock.
+            let stamp = state
+                .clocks
+                .tick(&call.slot)
+                .expect("the slot is in the run: checked above");
             let event = Event {
                 event_id: state.next_event_id,
                 slot: call.slot,
@@ -162,6 +200,7 @@ pub fn step(mut state: State, input: Input, now: i64) -> (State, Vec<Output>) {
                 path: None,
                 payload_hash: None,
                 tool_input: Some(call.tool_input_json),
+                tool_use_id: Some(call.tool_use_id),
                 wall_time: now,
             };
             state.next_event_id += 1;

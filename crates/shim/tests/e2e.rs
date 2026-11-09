@@ -81,6 +81,10 @@ async fn recorded_pre_tool_use_is_allowed_and_one_stamped_event_is_traced() {
     assert_eq!(event.kind, EventKind::BeforeTool);
     assert_eq!(event.slot, "slot-2");
     assert_eq!(event.session_id, fixture["session_id"].as_str().unwrap());
+    assert_eq!(
+        event.tool_use_id.as_deref(),
+        Some(fixture["tool_use_id"].as_str().unwrap())
+    );
     assert_eq!(event.tool.as_deref(), Some("Edit"));
     // The fixture's raw tool_input survives the whole path byte for byte (SPEC section 7).
     #[derive(serde::Deserialize)]

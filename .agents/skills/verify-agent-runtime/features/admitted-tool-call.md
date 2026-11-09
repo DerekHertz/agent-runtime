@@ -24,7 +24,7 @@ Preconditions:
 
 - **Start.** Launch the coordinator and wait for the socket. Run `verify.py drive admitted-tool-call`. The socket accepts a connection and stderr says `art-coordinator: listening on <sock>`.
 - **Call.** Send the Edit fixture as `slot-2`. Exit code `0`; stdout is exactly `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}`; stderr empty.
-- **Read the trace.** Query `trace.db` read-only. Exactly one row: `kind=BeforeTool`, `agent_id=slot-2`, `session_id=90c75de7-f344-4da3-9b24-152c5bfda374`, `tool=Edit`, `event_id=1`, `vclock=[0,1]`, `tool_input` NULL, and a 32-byte `payload_hash`.
+- **Read the trace.** Query `trace.db` read-only. Exactly one row: `kind=BeforeTool`, `agent_id=slot-2`, `session_id=90c75de7-f344-4da3-9b24-152c5bfda374`, `tool=Edit`, `tool_use_id=toolu_01Uy28i9ZxHpdQkCRWhbwK3g`, `event_id=1`, `vclock=[0,1]`, `tool_input` NULL, and a 32-byte `payload_hash`.
 - **Read the blob.** `runs/r1/blobs/` holds exactly one file, named by the lowercase hex of `payload_hash`. Its bytes are byte-identical to the fixture's raw `tool_input` text.
 - **Shut down.** SIGTERM the coordinator. Exit code `0` and the socket file is gone.
 - **Proof.** `summary.json` lists these checks; `admitted-tool-call/trace-after-edit.json` holds the row; `01-edit-slot-2.json` holds the command output.

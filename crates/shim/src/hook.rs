@@ -20,6 +20,7 @@ struct HookInput {
     tool_name: Option<String>,
     /// Kept as raw JSON so the coordinator receives the agent's input byte for byte.
     tool_input: Option<Box<RawValue>>,
+    tool_use_id: Option<String>,
 }
 
 /// What to do with a hook invocation.
@@ -51,6 +52,9 @@ pub fn parse_input(stdin: &str, slot: &str) -> Result<Action> {
     let tool_input = input
         .tool_input
         .ok_or_else(|| anyhow!("PreToolUse input has no tool_input"))?;
+    let tool_use_id = input
+        .tool_use_id
+        .ok_or_else(|| anyhow!("PreToolUse input has no tool_use_id"))?;
     let intent = intent(&tool, &tool_input);
     Ok(Action::BeforeTool(BeforeToolRequest {
         slot: slot.to_owned(),
@@ -58,6 +62,7 @@ pub fn parse_input(stdin: &str, slot: &str) -> Result<Action> {
         tool,
         tool_input_json: tool_input.get().to_owned(),
         intent,
+        tool_use_id,
     }))
 }
 
@@ -216,6 +221,7 @@ mod tests {
         assert_eq!(r.session_id, "90c75de7-f344-4da3-9b24-152c5bfda374");
         assert_eq!(r.tool, "Edit");
         assert_eq!(r.intent, "");
+        assert_eq!(r.tool_use_id, "toolu_01Uy28i9ZxHpdQkCRWhbwK3g");
         let want: Value = serde_json::from_str(EDIT).unwrap();
         let got: Value = serde_json::from_str(&r.tool_input_json).unwrap();
         assert_eq!(got, want["tool_input"]);
@@ -223,7 +229,7 @@ mod tests {
 
     #[test]
     fn tool_input_is_forwarded_verbatim_including_key_order_and_spacing() {
-        let stdin = r#"{"hook_event_name":"PreToolUse","session_id":"s","tool_name":"Write","tool_input":{"z": 1,  "a":[1, 2]}}"#;
+        let stdin = r#"{"hook_event_name":"PreToolUse","session_id":"s","tool_name":"Write","tool_input":{"z": 1,  "a":[1, 2]},"tool_use_id":"t"}"#;
         assert_eq!(
             before_tool(stdin).tool_input_json,
             r#"{"z": 1,  "a":[1, 2]}"#
@@ -246,7 +252,8 @@ mod tests {
             json!({"command": "ls"}),
             json!({"command": "ls", "description": 3}),
         ] {
-            let stdin = json!({"hook_event_name":"PreToolUse","session_id":"s","tool_name":"Bash","tool_input":input});
+            let stdin = json!({"hook_event_name":"PreToolUse","session_id":"s","tool_name":"Bash",
+                "tool_input":input,"tool_use_id":"t"});
             assert_eq!(before_tool(&stdin.to_string()).intent, "");
         }
     }
@@ -254,7 +261,7 @@ mod tests {
     #[test]
     fn only_bash_has_an_intent() {
         let stdin = json!({"hook_event_name":"PreToolUse","session_id":"s","tool_name":"Edit",
-            "tool_input":{"file_path":"/x","description":"not an intent"}});
+            "tool_input":{"file_path":"/x","description":"not an intent"},"tool_use_id":"t"});
         assert_eq!(before_tool(&stdin.to_string()).intent, "");
     }
 
@@ -274,7 +281,7 @@ mod tests {
 
     #[test]
     fn pre_tool_use_missing_fields_is_an_error() {
-        for missing in ["session_id", "tool_name", "tool_input"] {
+        for missing in ["session_id", "tool_name", "tool_input", "tool_use_id"] {
             let mut v: Value = serde_json::from_str(EDIT).unwrap();
             v.as_object_mut().unwrap().remove(missing);
             assert!(parse_input(&v.to_string(), "a").is_err(), "{missing}");

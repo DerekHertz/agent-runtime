@@ -13,6 +13,10 @@
 //! Traces written before blobs (issue #2) keep the raw input inline in `tool_input`;
 //! [`read_payload`] reads either form.
 //!
+//! Call identity: a tool event's row keeps Claude Code's `tool_use_id`. Traces written before it
+//! existed (issue #2 and issue #3 PR 2) have no such column; [`read_events`] reads them with
+//! `tool_use_id` `None` and never adds the column. A writer adds it only to an empty trace.
+//!
 //! File-system assumptions: when the writer starts, it flushes the run directory and every
 //! directory on its canonical path up to its filesystem's anchor (the topmost directory on the
 //! same device), whether or not it created them. Blob durability relies on the OS and drive honouring `fsync` (`F_FULLFSYNC`
@@ -101,6 +105,9 @@ pub struct Event {
     /// only for rows written before blobs (issue #2 traces), which kept it inline. Use
     /// [`read_payload`] to get the bytes from either form.
     pub tool_input: Option<String>,
+    /// Claude Code's `tool_use_id` for a tool event; with `session_id` it names the call. `None`
+    /// for events without one and for every row of a trace written before the column existed.
+    pub tool_use_id: Option<String>,
     /// Milliseconds since the Unix epoch. Display only, never for ordering.
     pub wall_time: i64,
 }
@@ -147,7 +154,8 @@ CREATE TABLE IF NOT EXISTS events (
     path         TEXT,
     payload_hash BLOB,
     tool_input   TEXT,
-    wall_time    INTEGER NOT NULL
+    wall_time    INTEGER NOT NULL,
+    tool_use_id  TEXT
 );
 CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events
 BEGIN SELECT RAISE(ABORT, 'trace is append-only'); END;
@@ -174,7 +182,8 @@ impl TraceWriter {
     /// [`BlobStore`] contract).
     /// Refused while another writer holds the run, and refused if the trace already holds events:
     /// the coordinator's clocks and event ids start from zero, so writing on would restamp
-    /// history. A refused run gets no `blobs/` directory.
+    /// history. A refused run gets no `blobs/` directory and no schema change. An empty trace from
+    /// before `tool_use_id` existed gets that column.
     pub fn create(run_dir: &Path) -> Result<Self, Error> {
         durable_dir::create(run_dir).map_err(|(path, source)| Error::Io { path, source })?;
         let lock_path = run_dir.join(LOCK_FILE);
@@ -211,6 +220,11 @@ impl TraceWriter {
                 events: events as u64,
             });
         }
+        if !has_tool_use_id(&conn)? {
+            // An empty trace created before the column existed. Nothing in it needs the column,
+            // so adding it changes no recorded event.
+            conn.execute_batch("ALTER TABLE events ADD COLUMN tool_use_id TEXT")?;
+        }
         let blobs = BlobStore::open(run_dir)?;
         Ok(Self {
             conn,
@@ -241,8 +255,8 @@ impl TraceWriter {
         self.conn.execute(
             "INSERT INTO events
                 (event_id, agent_id, session_id, vclock, kind, tool, path, payload_hash,
-                 tool_input, wall_time)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 tool_input, wall_time, tool_use_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 id,
                 event.slot,
@@ -254,6 +268,7 @@ impl TraceWriter {
                 payload_hash,
                 Option::<String>::None,
                 event.wall_time,
+                event.tool_use_id,
             ],
         )?;
         Ok(())
@@ -262,6 +277,13 @@ impl TraceWriter {
 
 fn to_row_id(event_id: u64) -> Result<i64, Error> {
     i64::try_from(event_id).map_err(|_| Error::EventIdRange(event_id))
+}
+
+/// Whether the `events` table has the `tool_use_id` column (traces from before it do not).
+fn has_tool_use_id(conn: &Connection) -> Result<bool, Error> {
+    let mut stmt =
+        conn.prepare("SELECT 1 FROM pragma_table_info('events') WHERE name = 'tool_use_id'")?;
+    Ok(stmt.exists([])?)
 }
 
 type Row = (
@@ -275,17 +297,24 @@ type Row = (
     Option<Vec<u8>>,
     Option<String>,
     i64,
+    Option<String>,
 );
 
 /// Read every event in `event_id` order. A minimal reader for tests and tooling; the real query
-/// layer is a later issue.
+/// layer is a later issue. Opens the database read-only: a trace from before `tool_use_id`
+/// existed is read as it is, with `tool_use_id` `None` on every row.
 pub fn read_events(db_path: &Path) -> Result<Vec<Event>, Error> {
     let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let mut stmt = conn.prepare(
+    let tool_use_id = if has_tool_use_id(&conn)? {
+        "tool_use_id"
+    } else {
+        "NULL"
+    };
+    let mut stmt = conn.prepare(&format!(
         "SELECT event_id, agent_id, session_id, vclock, kind, tool, path, payload_hash,
-                tool_input, wall_time
-         FROM events ORDER BY event_id",
-    )?;
+                tool_input, wall_time, {tool_use_id}
+         FROM events ORDER BY event_id"
+    ))?;
     let rows = stmt.query_map([], |row| -> rusqlite::Result<Row> {
         Ok((
             row.get(0)?,
@@ -298,12 +327,24 @@ pub fn read_events(db_path: &Path) -> Result<Vec<Event>, Error> {
             row.get(7)?,
             row.get(8)?,
             row.get(9)?,
+            row.get(10)?,
         ))
     })?;
     let mut events = Vec::new();
     for row in rows {
-        let (id, slot, session_id, vclock, kind, tool, path, payload_hash, tool_input, wall_time) =
-            row?;
+        let (
+            id,
+            slot,
+            session_id,
+            vclock,
+            kind,
+            tool,
+            path,
+            payload_hash,
+            tool_input,
+            wall_time,
+            tool_use_id,
+        ) = row?;
         let kind = EventKind::parse(&kind).ok_or(Error::UnknownKind { event_id: id, kind })?;
         events.push(Event {
             event_id: id as u64,
@@ -315,6 +356,7 @@ pub fn read_events(db_path: &Path) -> Result<Vec<Event>, Error> {
             path,
             payload_hash,
             tool_input,
+            tool_use_id,
             wall_time,
         });
     }
@@ -360,6 +402,7 @@ mod tests {
             path: None,
             payload_hash: None,
             tool_input: None,
+            tool_use_id: Some(format!("toolu_{id}")),
             wall_time: 1_700_000_000_123,
         }
     }

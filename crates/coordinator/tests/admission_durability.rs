@@ -12,7 +12,9 @@
 //! (e) concurrent calls never make each other fail;
 //! (f) every payload a row names is a stored blob: the blob is written before its row, a failed
 //!     blob write leaves no row and the state alone, and a failed row leaves at most an orphan
-//!     blob that no row names.
+//!     blob that no row names;
+//! (g) a session binds to one slot and a `(session_id, tool_use_id)` is recorded at most once,
+//!     and a failed append binds no session and uses no call identity.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -33,14 +35,20 @@ fn service(dir: &Path, slots: &[&str]) -> CoordinatorService {
     CoordinatorService::new(&config, TraceWriter::create(dir).unwrap()).unwrap()
 }
 
-/// A call whose raw tool input names it, so a trace row can be matched to the call that wrote it.
+/// A call from `slot`'s session whose `tool_use_id` and raw tool input both name it, so a trace
+/// row can be matched to the call that wrote it.
 fn request(slot: &str, call: &str) -> Request<BeforeToolRequest> {
+    request_in(slot, &format!("session-of-{slot}"), call)
+}
+
+fn request_in(slot: &str, session_id: &str, call: &str) -> Request<BeforeToolRequest> {
     Request::new(BeforeToolRequest {
         slot: slot.into(),
-        session_id: format!("session-of-{slot}"),
+        session_id: session_id.into(),
         tool: "Edit".into(),
-        tool_input_json: format!(r#"{{"call":"{call}"}}"#),
+        tool_input_json: raw_input(call),
         intent: String::new(),
+        tool_use_id: call.into(),
     })
 }
 
@@ -222,6 +230,14 @@ async fn concurrent_calls_get_consecutive_ids_and_increasing_stamps_and_never_co
             );
         }
     }
+    // Every row keeps its own call's tool_use_id: its payload names the same call.
+    for e in &events {
+        let id = e
+            .tool_use_id
+            .as_deref()
+            .expect("every row has a tool_use_id");
+        assert!(has_call(tmp.path(), std::slice::from_ref(e), id), "{id}");
+    }
     // Each slot's own entry counts 1, 2, 3, ... in id order.
     for (slot, index) in [("slot-1", 0usize), ("slot-2", 1)] {
         let own: Vec<u64> = events
@@ -318,4 +334,61 @@ async fn a_failed_row_after_its_blob_leaves_a_harmless_orphan_that_the_retry_reu
     assert_eq!((events[0].event_id, stamp(&events[0])), (1, vec![1]));
     assert!(has_call(tmp.path(), &events, "orphan"));
     assert_eq!(blob_files(tmp.path()), vec![orphan], "one file, reused");
+}
+
+/// Model actions `AppendFails` on a session's first call, then `Step` refusing an identity
+/// (`IdentityRefused`); rule (g). The failed call must bind no session and use no call identity:
+/// the same call is then admitted from a different slot with the failed call's id. Once recorded,
+/// repeating it or moving its session to another slot is denied without a row.
+#[tokio::test]
+async fn a_failed_append_binds_no_session_and_uses_no_call_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let svc = service(tmp.path(), &["slot-1", "slot-2"]);
+    let db = rusqlite::Connection::open(tmp.path().join(TRACE_FILE)).unwrap();
+    db.execute(
+        "INSERT INTO events (event_id, agent_id, session_id, vclock, kind, wall_time)
+         VALUES (1, 'planted', 'x', x'', 'BeforeTool', 0)",
+        [],
+    )
+    .unwrap();
+    let err = svc
+        .before_tool(request_in("slot-2", "sess-x", "c1"))
+        .await
+        .expect_err("the INSERT collides");
+    assert_eq!(err.code(), Code::Internal);
+    db.execute_batch("DROP TRIGGER events_no_delete; DELETE FROM events WHERE event_id = 1;")
+        .unwrap();
+
+    // Neither the binding to slot-2 nor the identity (sess-x, c1) was kept.
+    let adm = svc
+        .before_tool(request_in("slot-1", "sess-x", "c1"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(adm.verdict, Verdict::Allow as i32, "{}", adm.reason);
+    let events = trace(tmp.path());
+    assert_eq!(events.len(), 1);
+    assert_eq!((events[0].event_id, stamp(&events[0])), (1, vec![1, 0]));
+    assert_eq!(events[0].session_id, "sess-x");
+    assert_eq!(events[0].tool_use_id.as_deref(), Some("c1"));
+
+    for (slot, call, why) in [
+        ("slot-1", "c1", "already recorded"),
+        ("slot-2", "c2", "bound to slot"),
+    ] {
+        let denied = svc
+            .before_tool(request_in(slot, "sess-x", call))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(denied.verdict, Verdict::Deny as i32);
+        assert!(denied.reason.contains(why), "{}", denied.reason);
+    }
+    assert_eq!(trace(tmp.path()).len(), 1, "the refusals left no row");
+    // And they used no id or stamp.
+    svc.before_tool(request_in("slot-1", "sess-x", "c3"))
+        .await
+        .unwrap();
+    let events = trace(tmp.path());
+    assert_eq!((events[1].event_id, stamp(&events[1])), (2, vec![2, 0]));
 }

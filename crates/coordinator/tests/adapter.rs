@@ -29,13 +29,15 @@ async fn connect(socket: &Path) -> CoordinatorClient<Channel> {
     CoordinatorClient::new(channel)
 }
 
-fn request(slot: &str, tool: &str) -> BeforeToolRequest {
+/// A call from the session of `slot`, named by its own `tool_use_id`.
+fn request(slot: &str, tool: &str, tool_use_id: &str) -> BeforeToolRequest {
     BeforeToolRequest {
         slot: slot.into(),
-        session_id: "sess-1".into(),
+        session_id: format!("sess-of-{slot}"),
         tool: tool.into(),
         tool_input_json: r#"{"file_path":"src/lib.rs"}"#.into(),
         intent: String::new(),
+        tool_use_id: tool_use_id.into(),
     }
 }
 
@@ -79,7 +81,7 @@ async fn before_tool_is_allowed_stamped_and_appended_to_the_trace() {
 
     let mut client = connect(&socket).await;
     let adm = client
-        .before_tool(request("slot-1", "Edit"))
+        .before_tool(request("slot-1", "Edit", "toolu_1"))
         .await
         .unwrap()
         .into_inner();
@@ -91,14 +93,15 @@ async fn before_tool_is_allowed_stamped_and_appended_to_the_trace() {
     let e = &events[0];
     assert_eq!(e.kind, EventKind::BeforeTool);
     assert_eq!(e.slot, "slot-1");
-    assert_eq!(e.session_id, "sess-1");
+    assert_eq!(e.session_id, "sess-of-slot-1");
+    assert_eq!(e.tool_use_id.as_deref(), Some("toolu_1"));
     assert_eq!(e.tool.as_deref(), Some("Edit"));
     assert_eq!(Clock::from_bytes(&e.vclock).unwrap().entries(), &[1, 0]);
     assert!(e.wall_time > 1_600_000_000_000, "wall_time {}", e.wall_time);
 
     // An unknown slot is denied and leaves no event.
     let adm = client
-        .before_tool(request("slot-9", "Edit"))
+        .before_tool(request("slot-9", "Edit", "toolu_2"))
         .await
         .unwrap()
         .into_inner();
@@ -107,7 +110,10 @@ async fn before_tool_is_allowed_stamped_and_appended_to_the_trace() {
     assert_eq!(read_events(&run_dir.join("trace.db")).unwrap().len(), 1);
 
     // A second slot gets its own clock.
-    client.before_tool(request("slot-2", "Read")).await.unwrap();
+    client
+        .before_tool(request("slot-2", "Read", "toolu_3"))
+        .await
+        .unwrap();
     let events = read_events(&run_dir.join("trace.db")).unwrap();
     assert_eq!(events.len(), 2);
     assert_eq!(events[1].event_id, 2);

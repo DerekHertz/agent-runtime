@@ -197,6 +197,7 @@ fn allow_prints_the_allow_object_and_the_coordinator_sees_the_raw_call() {
     assert_eq!(call.session_id, hook["session_id"]);
     assert_eq!(call.tool, "Edit");
     assert_eq!(call.intent, "");
+    assert_eq!(call.tool_use_id, hook["tool_use_id"]);
     assert_eq!(parse(&call.tool_input_json), hook["tool_input"]);
 }
 

@@ -349,13 +349,14 @@ class Ctx:
         if db.exists():
             conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
             try:
-                q = "SELECT event_id, agent_id, session_id, vclock, kind, tool, path, payload_hash, tool_input, wall_time FROM events ORDER BY event_id"
+                q = "SELECT event_id, agent_id, session_id, vclock, kind, tool, path, payload_hash, tool_input, wall_time, tool_use_id FROM events ORDER BY event_id"
                 for r in conn.execute(q):
                     n = len(r[3]) // 8
                     source, payload = resolve_payload(run_dir, r[7], r[8])
                     rows.append({"event_id": r[0], "slot": r[1], "session_id": r[2], "vclock": list(struct.unpack(f"<{n}Q", r[3])),
                                  "kind": r[4], "tool": r[5], "path": r[6], "payload_hash": r[7].hex() if r[7] is not None else None,
-                                 "tool_input": r[8], "payload_source": source, "payload": payload, "wall_time": r[9]})
+                                 "tool_input": r[8], "payload_source": source, "payload": payload, "wall_time": r[9],
+                                 "tool_use_id": r[10]})
             finally:
                 conn.close()
         (self.dir / f"trace-{label}.json").write_text(json.dumps({"db": str(db), "rows": rows}, indent=2) + "\n")
@@ -397,6 +398,18 @@ def raw_tool_input(text):
         i += 1
     _, end = json.JSONDecoder().raw_decode(text, i)
     return text[i:end]
+
+
+def with_ids(text, session_id=None, tool_use_id=None):
+    """The hook JSON with its top-level session_id and/or tool_use_id values swapped, by text, so
+    every other byte (the raw tool_input included) stays as recorded."""
+    fx = json.loads(text)
+    for field, value in (("session_id", session_id), ("tool_use_id", tool_use_id)):
+        if value is not None:
+            old = f"\"{field}\":{json.dumps(fx[field])}"
+            assert text.count(old) == 1, old
+            text = text.replace(old, f"\"{field}\":{json.dumps(value)}")
+    return text
 
 
 def parse_json(s):
@@ -445,6 +458,7 @@ def j_admitted_tool_call(c):
         c.check("event is BeforeTool for slot-2, the fixture session, tool Edit",
                 (e.get("kind"), e.get("slot"), e.get("session_id"), e.get("tool")) == ("BeforeTool", "slot-2", fx["session_id"], "Edit"),
                 row={k: e.get(k) for k in ("kind", "slot", "session_id", "tool")})
+        c.check("the row keeps the fixture's tool_use_id", e.get("tool_use_id") == fx["tool_use_id"], tool_use_id=e.get("tool_use_id"))
         c.check("event_id is 1 and vclock is [0,1]", (e.get("event_id"), e.get("vclock")) == (1, [0, 1]),
                 event_id=e.get("event_id"), vclock=e.get("vclock"))
         c.check("the row keeps no inline tool_input", e.get("tool_input") is None, stored=e.get("tool_input"))
@@ -570,8 +584,10 @@ def j_clocks(c):
     s = c.scratch()
     try:
         edit, bash = c.fixtures["pre_tool_use_edit"], c.fixtures["pre_tool_use_bash"]
+        # A second Edit call with the same input: Claude Code gives it its own tool_use_id.
+        edit_again = with_ids(edit, tool_use_id="toolu_verify_edit_again")
         co = c.start("a", s, "r1", SLOTS)
-        for i, (slot, payload) in enumerate([("slot-1", edit), ("slot-2", bash), ("slot-1", edit)], 1):
+        for i, (slot, payload) in enumerate([("slot-1", edit), ("slot-2", bash), ("slot-1", edit_again)], 1):
             r = c.shim(f"call-{i}-{slot}", slot, co.socket, payload)
             c.check(f"call {i} ({slot}) allowed", r["exit_code"] == 0 and parse_json(r["stdout"]) == ALLOW, exit_code=r["exit_code"])
         rows = c.rows("final", s / "runs/r1")
@@ -601,7 +617,7 @@ def j_hook_input(c):
             r = c.shim(label, "slot-1", co.socket, payload)
             c.check(f"{label} inside a run: exit 2, stderr starts 'agent-runtime:'", is_blocked(r), exit_code=r["exit_code"], stderr=r["stderr"])
         fx = json.loads(edit)
-        for field in ("session_id", "tool_name", "tool_input"):
+        for field in ("session_id", "tool_name", "tool_input", "tool_use_id"):
             d = {k: v for k, v in fx.items() if k != field}
             r = c.shim(f"missing-{field}", "slot-1", co.socket, json.dumps(d))
             c.check(f"PreToolUse without {field}: exit 2", is_blocked(r), exit_code=r["exit_code"], stderr=r["stderr"])
@@ -609,6 +625,54 @@ def j_hook_input(c):
         c.check("...or the blob store", blob_names(s / "runs/r1") == [], blobs=blob_names(s / "runs/r1"))
         r = c.shim("valid-after", "slot-1", co.socket, edit)
         c.check("a valid call afterwards is allowed as event 1", r["exit_code"] == 0 and [x["event_id"] for x in c.rows("final", s / "runs/r1")] == [1])
+        co.stop()
+    finally:
+        c.drop_scratch(s)
+
+
+def j_call_identity(c):
+    s = c.scratch()
+    try:
+        edit = c.fixtures["pre_tool_use_edit"]
+        fx = json.loads(edit)
+        sess, tid = fx["session_id"], fx["tool_use_id"]
+        co = c.start("a", s, "r1", SLOTS)
+        run = s / "runs/r1"
+
+        def decision(label, slot, stdin):
+            r = c.shim(label, slot, co.socket, stdin)
+            d, reason = deny_reason(r)
+            return r["exit_code"], d, reason
+
+        code, d, _ = decision("first-call", "slot-1", edit)
+        c.check("first call of the session on slot-1 is allowed", (code, d) == (0, "allow"), exit_code=code, decision=d)
+        steps = [("repeat-before", "slot-1", edit, "already recorded"),
+                 ("session-on-other-slot", "slot-2", with_ids(edit, tool_use_id="toolu_verify_moved"), "bound to slot"),
+                 ("empty-tool-use-id", "slot-1", with_ids(edit, tool_use_id=""), "empty tool_use_id"),
+                 ("empty-session-id", "slot-1", with_ids(edit, session_id="", tool_use_id="toolu_verify_nosess"), "empty session_id")]
+        for label, slot, stdin, why in steps:
+            code, d, reason = decision(label, slot, stdin)
+            c.check(f"{label}: exit 0 with a deny decision whose reason says {why!r}", (code, d) == (0, "deny") and why in reason,
+                    exit_code=code, decision=d, reason=reason)
+        rows = c.rows("after-refusals", run)
+        c.check("the refusals recorded nothing: one row, event 1, vclock [1,0]", ids_clocks(rows) == [(1, [1, 0])], rows=ids_clocks(rows))
+        c.check("...and stored one blob only", len(blob_names(run) or []) == 1, blobs=blob_names(run))
+        calls = [("restart-same-slot", "slot-1", with_ids(edit, session_id="sess-verify-restart", tool_use_id="toolu_verify_r1")),
+                 ("same-id-other-session", "slot-2", with_ids(edit, session_id="sess-verify-other")),
+                 ("overlap-1", "slot-1", with_ids(edit, tool_use_id="toolu_verify_o1")),
+                 ("overlap-2", "slot-1", with_ids(edit, tool_use_id="toolu_verify_o2"))]
+        for label, slot, stdin in calls:
+            code, d, reason = decision(label, slot, stdin)
+            c.check(f"{label}: allowed", (code, d) == (0, "allow"), exit_code=code, decision=d, reason=reason)
+        rows = c.rows("final", run)
+        got = [(x["event_id"], x["slot"], x["session_id"], x["tool_use_id"], x["vclock"]) for x in rows]
+        want = [(1, "slot-1", sess, tid, [1, 0]), (2, "slot-1", "sess-verify-restart", "toolu_verify_r1", [2, 0]),
+                (3, "slot-2", "sess-verify-other", tid, [0, 1]), (4, "slot-1", sess, "toolu_verify_o1", [3, 0]),
+                (5, "slot-1", sess, "toolu_verify_o2", [4, 0])]
+        c.check("rows: a restarted session continues slot-1's clock, an equal id in another session is its own call, "
+                "and overlapping calls keep their own events", got == want, rows=got)
+        c.check("every row's blob is the fixture's raw tool_input",
+                all((x["payload_source"], x["payload"]) == ("blob", raw_tool_input(edit)) for x in rows))
         co.stop()
     finally:
         c.drop_scratch(s)
@@ -622,6 +686,7 @@ FEATURES = {
     "unknown-slot": j_unknown_slot,
     "slot-clocks": j_clocks,
     "hook-input": j_hook_input,
+    "call-identity": j_call_identity,
 }
 
 

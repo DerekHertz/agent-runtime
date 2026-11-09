@@ -95,6 +95,7 @@ impl Coordinator for CoordinatorService {
             tool: req.tool,
             tool_input_json: req.tool_input_json,
             intent: req.intent,
+            tool_use_id: req.tool_use_id,
         };
         let admission = self.before_tool(call, now_ms())?;
         Ok(Response::new(to_wire(admission)))
@@ -267,15 +268,17 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::identity::CallKey;
     use trace_store::read_events;
 
-    fn call(slot: &str) -> BeforeTool {
+    fn call(slot: &str, session_id: &str, tool_use_id: &str) -> BeforeTool {
         BeforeTool {
             slot: slot.into(),
-            session_id: "s".into(),
+            session_id: session_id.into(),
             tool: "Edit".into(),
             tool_input_json: "{}".into(),
             intent: String::new(),
+            tool_use_id: tool_use_id.into(),
         }
     }
 
@@ -302,15 +305,26 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            svc.before_tool(call("slot-1"), 5).unwrap().verdict,
+            svc.before_tool(call("slot-1", "s", "t1"), 5)
+                .unwrap()
+                .verdict,
             Verdict::Allow
         );
-        let err = svc.before_tool(call("slot-1"), 6).unwrap_err();
+        // A new session's first call fails to append: it must bind nothing and use no identity.
+        let err = svc.before_tool(call("slot-2", "s2", "t2"), 6).unwrap_err();
         assert_eq!(err.code(), tonic::Code::Internal);
 
         let inner = svc.inner.lock().unwrap();
         assert_eq!(inner.state.next_event_id(), 2);
         assert_eq!(inner.state.clock("slot-1").unwrap().entries(), &[1, 0]);
+        assert_eq!(inner.state.clock("slot-2").unwrap().entries(), &[0, 0]);
+        assert_eq!(inner.state.session_slot("s"), Some("slot-1"));
+        assert_eq!(inner.state.session_slot("s2"), None);
+        let failed = CallKey {
+            session_id: "s2".into(),
+            tool_use_id: "t2".into(),
+        };
+        assert_eq!(inner.state.call(&failed), None);
         drop(inner);
         // Only the planted row and the first call's row are in the trace.
         let ids: Vec<u64> = read_events(&tmp.path().join("trace.db"))
@@ -325,7 +339,7 @@ mod tests {
     fn unknown_slot_is_denied_without_recording() {
         let tmp = tempfile::tempdir().unwrap();
         let svc = service(tmp.path(), &["slot-1"]);
-        let adm = svc.before_tool(call("nope"), 0).unwrap();
+        let adm = svc.before_tool(call("nope", "s", "t1"), 0).unwrap();
         assert_eq!(adm.verdict, Verdict::Deny);
         assert!(read_events(&tmp.path().join("trace.db"))
             .unwrap()
@@ -423,7 +437,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let run_dir = tmp.path().join("run");
         let svc = service(&run_dir, &["slot-1"]);
-        svc.before_tool(call("slot-1"), 0).unwrap();
+        svc.before_tool(call("slot-1", "s", "t1"), 0).unwrap();
         drop(svc);
         let err = bind(config(tmp.path(), "run")).expect_err("nonempty run refused");
         assert!(
