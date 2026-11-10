@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Verification harness for agent-runtime: drives the REAL art-coordinator and art-shim binaries.
 
-    verify.py build                 cargo build --workspace --locked --offline
+    verify.py build                 cargo clean -p <each workspace package>, cargo build --workspace, write the receipt
     verify.py doctor [--save]       read-only readiness check (exit 0 ready, 2 blocked)
-    verify.py drive <feature|all>   run journeys, write evidence + summary.json (exit 0 pass, 1 fail, 2 blocked)
+    verify.py drive <feature|all>   run journeys, write evidence + summary.json (exit 0 pass, 1 fail, 2 blocked);
+                                    PASS also needs the end checks: sources, receipt and binaries as at the start
     verify.py cleanup               stop only what this harness started, remove scratch dirs, keep evidence
     verify.py list                  list feature ids
 
@@ -11,6 +12,11 @@ Python 3 stdlib only. Evidence: <repo>/.claude/reviews/evidence/verify-agent-run
 """
 import argparse, datetime, hashlib, json, os, pathlib, shutil, signal, socket, sqlite3
 import struct, subprocess, sys, tempfile, time, traceback
+
+sys.dont_write_bytecode = True  # importing the journey module must leave no __pycache__ in the skill
+import after_tool  # noqa: E402  the after-tool journey, in its own file (scripts/after_tool.py)
+import failed_tool  # noqa: E402  the failed-tool journey (scripts/failed_tool.py)
+import lifecycle  # noqa: E402  the lifecycle journey, Stop and SessionEnd (scripts/lifecycle.py)
 
 SCRIPT = pathlib.Path(__file__).resolve()
 SKILL = SCRIPT.parents[1]
@@ -21,6 +27,10 @@ FIXTURES = REPO / "crates/shim/tests/fixtures"
 ENV_VARS = ("AGENT_RUNTIME_SLOT", "AGENT_RUNTIME_SOCKET")
 MAX_SOCKET_PATH = 100  # macOS sun_path is 104 bytes including the NUL
 ALLOW = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow"}}
+# Hook JSON in FIXTURES (see its README.md): the *_synthetic ones were written by hand, not recorded.
+FIXTURE_NAMES = ("pre_tool_use_edit", "pre_tool_use_bash", "pre_tool_use_read", "pre_tool_use_write_synthetic",
+                 "pre_tool_use_notebook_edit_synthetic", "post_tool_use_edit", "post_tool_use_failure_bash",
+                 "stop", "session_end")
 
 
 def utc():
@@ -198,8 +208,7 @@ def doctor_checks(args):
     if bins["art-shim"].is_file():
         r = subprocess.run([str(bins["art-shim"])], input="", capture_output=True, text=True, env=clean_env(), timeout=10)
         add("art-shim with no env exits 0 silently", (r.returncode, r.stdout, r.stderr) == (0, "", ""), f"exit {r.returncode}")
-    fixtures = ("pre_tool_use_edit.json", "pre_tool_use_bash.json", "post_tool_use_edit.json")
-    missing = [n for n in fixtures if not (FIXTURES / n).is_file()]
+    missing = [f"{n}.json" for n in FIXTURE_NAMES if not (FIXTURES / f"{n}.json").is_file()]
     add("hook fixtures present", not missing, f"missing {missing}" if missing else str(FIXTURES))
     add("python sqlite3 module", bool(sqlite3.sqlite_version), sqlite3.sqlite_version)
     root = pathlib.Path(args.scratch_root)
@@ -224,12 +233,41 @@ def cmd_doctor(args):
     return 0 if all(c["passed"] for c in checks) else 2
 
 
+def workspace_packages():
+    """The root workspace's own package names, from `cargo metadata --no-deps`; (names, error)."""
+    r = sh(["cargo", "metadata", "--no-deps", "--format-version", "1", "--locked", "--offline"], cwd=REPO)
+    if r.returncode != 0:
+        return None, f"cargo metadata exited {r.returncode}: {r.stderr.strip()}"
+    try:
+        meta = json.loads(r.stdout)
+        members = set(meta["workspace_members"])
+        names = sorted(p["name"] for p in meta["packages"] if p["id"] in members)
+    except (ValueError, KeyError, TypeError) as e:
+        return None, f"unreadable cargo metadata: {e}"
+    return (names, None) if names else (None, "cargo metadata lists no workspace members")
+
+
 def cmd_build(args):
-    """cargo build, then record which sources produced which binaries (the receipt doctor checks)."""
+    """Clean the workspace's own packages, cargo build, then record which sources produced which
+    binaries (the receipt doctor checks)."""
     receipt = receipt_path(args)
     receipt.unlink(missing_ok=True)  # a failed or raced build must not leave an older receipt vouching for it
     before = source_manifest()
     env = dict(os.environ, CARGO_TARGET_DIR=str(target_dir(args)))
+    # Cargo decides freshness by mtime, so a source restored with an older mtime than its artifact
+    # (a mutation check, a `cp -p`, a checkout) leaves the stale artifact in place. Cleaning the
+    # workspace's own packages forces them to rebuild from the bytes the receipt hashes; third-party
+    # dependencies stay cached. `cargo clean` has no --workspace, hence one -p per member.
+    names, err = workspace_packages()
+    if names is None:
+        print(f"clean: {err}; no receipt written")
+        return 1
+    print(f"clean: cargo clean -p for the workspace packages {names} in {target_dir(args)}")
+    clean = ["cargo", "clean", "--locked", "--offline"] + [a for n in names for a in ("-p", n)]
+    rc = subprocess.run(clean, cwd=REPO, env=env).returncode
+    if rc != 0:
+        print(f"clean: cargo clean exited {rc}; no receipt written")
+        return rc
     rc = subprocess.run(["cargo", "build", "--workspace", "--locked", "--offline"], cwd=REPO, env=env).returncode
     if rc != 0:
         return rc
@@ -240,7 +278,7 @@ def cmd_build(args):
     bins = {name: sha256(p) for name, p in binaries(args).items()}
     receipt.write_text(json.dumps({"built_utc": utc(), "sources_aggregate_sha256": after["aggregate_sha256"],
                                    "source_file_count": after["file_count"], "binaries": bins,
-                                   "target_dir": str(target_dir(args))}, indent=2) + "\n")
+                                   "cleaned_packages": names, "target_dir": str(target_dir(args))}, indent=2) + "\n")
     print(f"build receipt: {receipt}")
     return 0
 
@@ -270,7 +308,7 @@ class Ctx:
         self.dir = ev / name
         self.dir.mkdir(parents=True)
         self.n, self.checks, self.commands = 0, [], []
-        self.fixtures = {k: (FIXTURES / f"{k}.json").read_text() for k in ("pre_tool_use_edit", "pre_tool_use_bash", "post_tool_use_edit")}
+        self.fixtures = {k: (FIXTURES / f"{k}.json").read_text() for k in FIXTURE_NAMES}
 
     def check(self, name, ok, **info):
         self.checks.append({"name": name, "passed": bool(ok), **info})
@@ -294,13 +332,14 @@ class Ctx:
         self.commands.append({"label": label, "exit_code": rec["exit_code"], "file": str(f.relative_to(self.dir.parent))})
         return rec
 
-    def shim(self, label, slot, socket_path, stdin, **kw):
+    def shim(self, label, slot, socket_path, stdin, args=(), **kw):
+        """Run art-shim as Claude Code would; `args` is the hook registration's command line."""
         env = {}
         if slot is not None:
             env["AGENT_RUNTIME_SLOT"] = slot
         if socket_path is not None:
             env["AGENT_RUNTIME_SOCKET"] = str(socket_path)
-        return self.run(label, [self.bins["art-shim"]], env=env, stdin=stdin, **kw)
+        return self.run(label, [self.bins["art-shim"], *args], env=env, stdin=stdin, **kw)
 
     def coordinator_argv(self, run_id, slots, runs_dir, sock):
         return [self.bins["art-coordinator"], "--run-id", run_id, "--slots", ",".join(slots),
@@ -349,11 +388,18 @@ class Ctx:
         if db.exists():
             conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
             try:
-                q = "SELECT event_id, agent_id, session_id, vclock, kind, tool, path, payload_hash, tool_input, wall_time FROM events ORDER BY event_id"
+                q = ("SELECT event_id, agent_id, session_id, vclock, kind, tool, path, payload_hash, tool_input, wall_time, "
+                     "tool_use_id, before_event_id, outcome, input_payload_hash, is_interrupt FROM events ORDER BY event_id")
                 for r in conn.execute(q):
                     n = len(r[3]) // 8
+                    source, payload = resolve_payload(run_dir, r[7], r[8])
+                    in_source, in_payload = resolve_payload(run_dir, r[13], None)
                     rows.append({"event_id": r[0], "slot": r[1], "session_id": r[2], "vclock": list(struct.unpack(f"<{n}Q", r[3])),
-                                 "kind": r[4], "tool": r[5], "path": r[6], "payload_hash": r[7], "tool_input": r[8], "wall_time": r[9]})
+                                 "kind": r[4], "tool": r[5], "path": r[6], "payload_hash": r[7].hex() if r[7] is not None else None,
+                                 "tool_input": r[8], "payload_source": source, "payload": payload, "wall_time": r[9],
+                                 "tool_use_id": r[10], "before_event_id": r[11], "outcome": r[12],
+                                 "input_payload_hash": r[13].hex() if r[13] is not None else None,
+                                 "input_payload_source": in_source, "input_payload": in_payload, "is_interrupt": r[14]})
             finally:
                 conn.close()
         (self.dir / f"trace-{label}.json").write_text(json.dumps({"db": str(db), "rows": rows}, indent=2) + "\n")
@@ -369,6 +415,24 @@ class Ctx:
         unregister(lambda e: e.get("kind") == "scratch" and e["scratch"] == str(d))
 
 
+def resolve_payload(run_dir, payload_hash, inline):
+    """Where a row's payload lives and its exact text: ("blob", text) read from blobs/<hex of the
+    hash>, ("inline", text) for an issue #2 row, ("none", None), or ("missing", None) when the row
+    names a blob that is not there (or a hash that is not 32 bytes). The blob's name is not
+    rehashed here: python's stdlib has no blake3, so hash correctness is the Rust tests' job."""
+    if payload_hash is None:
+        return ("inline", inline) if inline is not None else ("none", None)
+    blob = pathlib.Path(run_dir) / "blobs" / payload_hash.hex()
+    if len(payload_hash) != 32 or not blob.is_file():
+        return ("missing", None)
+    return ("blob", blob.read_bytes().decode("utf-8", "surrogateescape"))
+
+
+def blob_names(run_dir):
+    d = pathlib.Path(run_dir) / "blobs"
+    return sorted(p.name for p in d.iterdir()) if d.is_dir() else None
+
+
 def raw_tool_input(text):
     key = '"tool_input":'
     assert text.count(key) == 1
@@ -377,6 +441,18 @@ def raw_tool_input(text):
         i += 1
     _, end = json.JSONDecoder().raw_decode(text, i)
     return text[i:end]
+
+
+def with_ids(text, session_id=None, tool_use_id=None):
+    """The hook JSON with its top-level session_id and/or tool_use_id values swapped, by text, so
+    every other byte (the raw tool_input included) stays as recorded."""
+    fx = json.loads(text)
+    for field, value in (("session_id", session_id), ("tool_use_id", tool_use_id)):
+        if value is not None:
+            old = f"\"{field}\":{json.dumps(fx[field])}"
+            assert text.count(old) == 1, old
+            text = text.replace(old, f"\"{field}\":{json.dumps(value)}")
+    return text
 
 
 def parse_json(s):
@@ -425,10 +501,16 @@ def j_admitted_tool_call(c):
         c.check("event is BeforeTool for slot-2, the fixture session, tool Edit",
                 (e.get("kind"), e.get("slot"), e.get("session_id"), e.get("tool")) == ("BeforeTool", "slot-2", fx["session_id"], "Edit"),
                 row={k: e.get(k) for k in ("kind", "slot", "session_id", "tool")})
+        c.check("the row keeps the fixture's tool_use_id", e.get("tool_use_id") == fx["tool_use_id"], tool_use_id=e.get("tool_use_id"))
         c.check("event_id is 1 and vclock is [0,1]", (e.get("event_id"), e.get("vclock")) == (1, [0, 1]),
                 event_id=e.get("event_id"), vclock=e.get("vclock"))
-        c.check("tool_input is byte-identical to the fixture's raw tool_input", e.get("tool_input") == raw_tool_input(edit),
-                stored=e.get("tool_input"))
+        c.check("the row keeps no inline tool_input", e.get("tool_input") is None, stored=e.get("tool_input"))
+        h = e.get("payload_hash")
+        c.check("payload_hash is 32 bytes and names the only file in blobs/",
+                h is not None and len(h) == 64 and blob_names(s / "runs/r1") == [h], payload_hash=h, blobs=blob_names(s / "runs/r1"))
+        c.check("the blob's bytes are byte-identical to the fixture's raw tool_input",
+                (e.get("payload_source"), e.get("payload")) == ("blob", raw_tool_input(edit)),
+                source=e.get("payload_source"), stored=e.get("payload"))
         # wall_time is display-only (SPEC section 5): recorded as evidence, never a pass/fail criterion.
         (c.dir / "wall-time.txt").write_text(f"call window {t0}..{t1} ms; event wall_time {e.get('wall_time')} (informational only)\n")
         c.check("coordinator stderr announces its socket", f"listening on {co.socket}" in (c.dir / "coordinator-a.stderr").read_text())
@@ -531,6 +613,7 @@ def j_unknown_slot(c):
         c.check("shim exits 0 with a deny decision", r["exit_code"] == 0 and decision == "deny", exit_code=r["exit_code"], stdout=r["stdout"])
         c.check("deny reason names the unknown slot", 'unknown slot "slot-9"' in reason, reason=reason)
         c.check("no event was recorded", c.rows("after-unknown", s / "runs/r1") == [])
+        c.check("no payload blob was stored for the denied call", blob_names(s / "runs/r1") == [], blobs=blob_names(s / "runs/r1"))
         r = c.shim("valid-after-unknown", "slot-1", co.socket, edit)
         rows = c.rows("after-valid", s / "runs/r1")
         c.check("a valid slot afterwards is allowed as event 1 with vclock [1,0] (the deny consumed nothing)",
@@ -544,8 +627,10 @@ def j_clocks(c):
     s = c.scratch()
     try:
         edit, bash = c.fixtures["pre_tool_use_edit"], c.fixtures["pre_tool_use_bash"]
+        # A second Edit call with the same input: Claude Code gives it its own tool_use_id.
+        edit_again = with_ids(edit, tool_use_id="toolu_verify_edit_again")
         co = c.start("a", s, "r1", SLOTS)
-        for i, (slot, payload) in enumerate([("slot-1", edit), ("slot-2", bash), ("slot-1", edit)], 1):
+        for i, (slot, payload) in enumerate([("slot-1", edit), ("slot-2", bash), ("slot-1", edit_again)], 1):
             r = c.shim(f"call-{i}-{slot}", slot, co.socket, payload)
             c.check(f"call {i} ({slot}) allowed", r["exit_code"] == 0 and parse_json(r["stdout"]) == ALLOW, exit_code=r["exit_code"])
         rows = c.rows("final", s / "runs/r1")
@@ -553,8 +638,12 @@ def j_clocks(c):
         c.check("each slot's own counter advances, the other's stays put: [1,0] [0,1] [2,0]",
                 [x["vclock"] for x in rows] == [[1, 0], [0, 1], [2, 0]], vclocks=[x["vclock"] for x in rows])
         c.check("slots recorded in call order", [x["slot"] for x in rows] == ["slot-1", "slot-2", "slot-1"])
-        c.check("Bash call stored with tool Bash and raw tool_input byte-identical",
-                len(rows) > 1 and rows[1]["tool"] == "Bash" and rows[1]["tool_input"] == raw_tool_input(bash))
+        c.check("Bash call stored with tool Bash and its blob byte-identical to the raw tool_input",
+                len(rows) > 1 and rows[1]["tool"] == "Bash" and (rows[1]["payload_source"], rows[1]["payload"]) == ("blob", raw_tool_input(bash)))
+        hashes = [x["payload_hash"] for x in rows]
+        c.check("the two Edit calls share one blob; blobs/ holds exactly the Edit and Bash blobs, no temporary files",
+                len(rows) == 3 and hashes[0] == hashes[2] != hashes[1] and blob_names(s / "runs/r1") == sorted({hashes[0], hashes[1]}),
+                payload_hashes=hashes, blobs=blob_names(s / "runs/r1"))
         co.stop()
     finally:
         c.drop_scratch(s)
@@ -571,13 +660,68 @@ def j_hook_input(c):
             r = c.shim(label, "slot-1", co.socket, payload)
             c.check(f"{label} inside a run: exit 2, stderr starts 'agent-runtime:'", is_blocked(r), exit_code=r["exit_code"], stderr=r["stderr"])
         fx = json.loads(edit)
-        for field in ("session_id", "tool_name", "tool_input"):
+        for field in ("session_id", "tool_name", "tool_input", "tool_use_id"):
             d = {k: v for k, v in fx.items() if k != field}
             r = c.shim(f"missing-{field}", "slot-1", co.socket, json.dumps(d))
             c.check(f"PreToolUse without {field}: exit 2", is_blocked(r), exit_code=r["exit_code"], stderr=r["stderr"])
         c.check("none of those reached the trace", c.rows("after-bad-input", s / "runs/r1") == [])
+        c.check("...or the blob store", blob_names(s / "runs/r1") == [], blobs=blob_names(s / "runs/r1"))
         r = c.shim("valid-after", "slot-1", co.socket, edit)
         c.check("a valid call afterwards is allowed as event 1", r["exit_code"] == 0 and [x["event_id"] for x in c.rows("final", s / "runs/r1")] == [1])
+        co.stop()
+    finally:
+        c.drop_scratch(s)
+
+
+def j_call_identity(c):
+    s = c.scratch()
+    try:
+        edit = c.fixtures["pre_tool_use_edit"]
+        fx = json.loads(edit)
+        sess, tid = fx["session_id"], fx["tool_use_id"]
+        retry = with_ids(edit, tool_use_id="toolu_verify_notool")
+        assert retry.count('"tool_name":"Edit"') == 1
+        no_tool = retry.replace('"tool_name":"Edit"', '"tool_name":""')
+        co = c.start("a", s, "r1", SLOTS)
+        run = s / "runs/r1"
+
+        def decision(label, slot, stdin):
+            r = c.shim(label, slot, co.socket, stdin)
+            d, reason = deny_reason(r)
+            return r["exit_code"], d, reason
+
+        code, d, _ = decision("first-call", "slot-1", edit)
+        c.check("first call of the session on slot-1 is allowed", (code, d) == (0, "allow"), exit_code=code, decision=d)
+        steps = [("repeat-before", "slot-1", edit, "already recorded"),
+                 ("session-on-other-slot", "slot-2", with_ids(edit, tool_use_id="toolu_verify_moved"), "bound to slot"),
+                 ("empty-tool-use-id", "slot-1", with_ids(edit, tool_use_id=""), "empty tool_use_id"),
+                 ("empty-session-id", "slot-1", with_ids(edit, session_id="", tool_use_id="toolu_verify_nosess"), "empty session_id"),
+                 ("empty-tool-name", "slot-1", no_tool, "no tool")]
+        for label, slot, stdin, why in steps:
+            code, d, reason = decision(label, slot, stdin)
+            c.check(f"{label}: exit 0 with a deny decision whose reason says {why!r}", (code, d) == (0, "deny") and why in reason,
+                    exit_code=code, decision=d, reason=reason)
+        rows = c.rows("after-refusals", run)
+        c.check("the refusals recorded nothing: one row, event 1, vclock [1,0]", ids_clocks(rows) == [(1, [1, 0])], rows=ids_clocks(rows))
+        c.check("...and stored one blob only", len(blob_names(run) or []) == 1, blobs=blob_names(run))
+        calls = [("restart-same-slot", "slot-1", with_ids(edit, session_id="sess-verify-restart", tool_use_id="toolu_verify_r1")),
+                 ("same-id-other-session", "slot-2", with_ids(edit, session_id="sess-verify-other")),
+                 ("overlap-1", "slot-1", with_ids(edit, tool_use_id="toolu_verify_o1")),
+                 ("overlap-2", "slot-1", with_ids(edit, tool_use_id="toolu_verify_o2")),
+                 ("empty-tool-retry", "slot-1", retry)]
+        for label, slot, stdin in calls:
+            code, d, reason = decision(label, slot, stdin)
+            c.check(f"{label}: allowed", (code, d) == (0, "allow"), exit_code=code, decision=d, reason=reason)
+        rows = c.rows("final", run)
+        got = [(x["event_id"], x["slot"], x["session_id"], x["tool_use_id"], x["vclock"]) for x in rows]
+        want = [(1, "slot-1", sess, tid, [1, 0]), (2, "slot-1", "sess-verify-restart", "toolu_verify_r1", [2, 0]),
+                (3, "slot-2", "sess-verify-other", tid, [0, 1]), (4, "slot-1", sess, "toolu_verify_o1", [3, 0]),
+                (5, "slot-1", sess, "toolu_verify_o2", [4, 0]), (6, "slot-1", sess, "toolu_verify_notool", [5, 0])]
+        c.check("rows: a restarted session continues slot-1's clock, an equal id in another session is its own call, "
+                "overlapping calls keep their own events, and the empty-tool call's id was left free for its retry",
+                got == want, rows=got)
+        c.check("every row's blob is the fixture's raw tool_input",
+                all((x["payload_source"], x["payload"]) == ("blob", raw_tool_input(edit)) for x in rows))
         co.stop()
     finally:
         c.drop_scratch(s)
@@ -591,6 +735,10 @@ FEATURES = {
     "unknown-slot": j_unknown_slot,
     "slot-clocks": j_clocks,
     "hook-input": j_hook_input,
+    "call-identity": j_call_identity,
+    "after-tool": lambda c: after_tool.journey(c, sys.modules[__name__]),
+    "failed-tool": lambda c: failed_tool.journey(c, sys.modules[__name__]),
+    "lifecycle": lambda c: lifecycle.journey(c, sys.modules[__name__]),
 }
 
 
@@ -635,6 +783,26 @@ def quiet_cleanup():
         return cmd_cleanup()
 
 
+def end_checks(args, manifest, start_receipt):
+    """The run's end guard: what doctor vouched for at the start still holds after the journeys.
+
+    These compare two endpoints only. An edit made and undone (or a binary swapped and swapped
+    back) between them is invisible here, so the sources and target dir must still stay frozen
+    while a drive runs.
+    """
+    out = []
+    add = lambda name, ok, detail="": out.append({"name": name, "passed": bool(ok), "detail": detail})
+    now = source_manifest()
+    was, cur = manifest["files"], now["files"]
+    changed = sorted(k for k in set(was) | set(cur) if was.get(k) != cur.get(k))
+    add("end: sources unchanged since the run started", now["aggregate_sha256"] == manifest["aggregate_sha256"],
+        f"start {manifest['aggregate_sha256']}, end {now['aggregate_sha256']}; changed {changed}")
+    add("end: build receipt is the one doctor checked at the start", load_receipt(args) == start_receipt,
+        str(receipt_path(args)))
+    out.extend(dict(c, name=f"end: {c['name']}") for c in receipt_checks(args))
+    return out
+
+
 def cmd_drive(args):
     names = list(FEATURES) if args.feature == "all" else [args.feature]
     bad = [n for n in names if n not in FEATURES]
@@ -671,12 +839,20 @@ def cmd_drive(args):
         summary["features"][name] = {"passed": bool(c.checks) and all(k["passed"] for k in c.checks), "started_utc": started,
                                      "finished_utc": utc(), "checks": c.checks, "commands": c.commands}
         quiet_cleanup()
-    ok = all(f["passed"] for f in summary["features"].values())
-    summary["sources"]["unchanged_during_run"] = source_manifest()["aggregate_sha256"] == manifest["aggregate_sha256"]
-    summary.update(status="PASS" if ok else "FAIL", finished_utc=utc())
+    end = end_checks(args, manifest, summary["build_receipt"])
+    summary["end_checks"] = end
+    summary["sources"]["unchanged_during_run"] = end[0]["passed"]
+    reasons = [f"feature {n} failed" for n, f in summary["features"].items() if not f["passed"]]
+    reasons += [f"{c['name']} failed: {c['detail']}" for c in end if not c["passed"]]
+    ok = not reasons
+    summary.update(status="PASS" if ok else "FAIL", status_reasons=reasons, finished_utc=utc())
     (ev / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    for c in end:
+        print(f"[{'ok' if c['passed'] else 'FAIL'}] {c['name']}: {c['detail']}")
     for n, f in summary["features"].items():
         print(f"{'PASS' if f['passed'] else 'FAIL'} {n} ({sum(k['passed'] for k in f['checks'])}/{len(f['checks'])} checks)")
+    for r in reasons:
+        print(f"FAIL reason: {r}")
     print(f"{summary['status']}: evidence in {ev}")
     return 0 if ok else 1
 

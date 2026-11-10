@@ -2,7 +2,7 @@
 //! events to the run's SQLite trace (SPEC section 7).
 //!
 //! All decisions live in [`crate::core::step`]; this file only converts messages, performs the
-//! `Record` outputs, and answers with the `Admit` output.
+//! `Record` output, and answers with the `Admit` or `Ack` output.
 
 use std::fs::{File, TryLockError};
 use std::future::Future;
@@ -13,14 +13,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use runtime_proto::v1::admission::Verdict as WireVerdict;
+use runtime_proto::v1::after_tool_report::Result as WireResult;
 use runtime_proto::v1::coordinator_server::{Coordinator, CoordinatorServer};
-use runtime_proto::v1::{Admission as WireAdmission, BeforeToolRequest};
+use runtime_proto::v1::{
+    Ack as WireAck, Admission as WireAdmission, AfterToolReport, BeforeToolRequest,
+    LifecycleEvent as WireLifecycleEvent, LifecycleReport,
+};
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::{Request, Response, Status};
 use trace_store::TraceWriter;
 
-use crate::core::{self, Admission, BeforeTool, Input, Output, RunConfig, State, Verdict};
+use crate::core::{
+    self, Ack, Admission, AfterTool, BeforeTool, Input, Lifecycle, LifecycleKind, Output,
+    RunConfig, State, ToolResult, Verdict,
+};
 
 #[derive(Debug)]
 pub struct ServeConfig {
@@ -56,29 +63,60 @@ impl CoordinatorService {
         })
     }
 
-    /// Step the core on a copy of the state, append every recorded event, and only then commit the
-    /// new state. If an append fails the old state stays, so a retry reuses the same event id and
-    /// clock stamp, and the caller gets an error (the shim turns it into exit 2).
-    fn before_tool(&self, call: BeforeTool, now: i64) -> Result<Admission, Status> {
+    /// Step the core on a copy of the state, append its recorded event, and only then commit the
+    /// new state; return the core's answer (`Admit` or `Ack`). If the append fails the old state
+    /// stays, so a retry reuses the same event id and clock stamp, binds no session and completes
+    /// no call, and the caller gets an error (the shim turns it into exit 2 for a BeforeTool and
+    /// a nonblocking exit 1 for a report).
+    fn step_and_record(&self, input: Input, now: i64) -> Result<Output, Status> {
         let mut inner = self
             .inner
             .lock()
             .map_err(|_| Status::internal("coordinator state is poisoned"))?;
-        let (next, outputs) = core::step(inner.state.clone(), Input::BeforeTool(call), now);
-        let mut admission = None;
+        let (next, outputs) = core::step(inner.state.clone(), input, now);
+        let mut answer = None;
         for output in outputs {
             match output {
                 Output::Record(event) => inner
                     .trace
                     .append(&event)
                     .map_err(|e| Status::internal(format!("trace append failed: {e}")))?,
-                Output::Admit(a) => admission = Some(a),
+                other => answer = Some(other),
             }
         }
-        let admission =
-            admission.ok_or_else(|| Status::internal("coordinator core produced no admission"))?;
+        let answer =
+            answer.ok_or_else(|| Status::internal("coordinator core produced no answer"))?;
         inner.state = next;
-        Ok(admission)
+        Ok(answer)
+    }
+
+    fn before_tool(&self, call: BeforeTool, now: i64) -> Result<Admission, Status> {
+        match self.step_and_record(Input::BeforeTool(call), now)? {
+            Output::Admit(admission) => Ok(admission),
+            _ => Err(Status::internal(
+                "coordinator core answered a BeforeTool with no admission",
+            )),
+        }
+    }
+
+    /// A refused report recorded nothing and is a `FailedPrecondition` with the core's reason.
+    fn after_tool(&self, report: AfterTool, now: i64) -> Result<(), Status> {
+        self.report(Input::AfterTool(report), now)
+    }
+
+    /// A Stop or SessionEnd report, answered like an AfterTool report.
+    fn lifecycle(&self, report: Lifecycle, now: i64) -> Result<(), Status> {
+        self.report(Input::Lifecycle(report), now)
+    }
+
+    fn report(&self, input: Input, now: i64) -> Result<(), Status> {
+        match self.step_and_record(input, now)? {
+            Output::Ack(Ack::Recorded) => Ok(()),
+            Output::Ack(Ack::Refused { reason }) => Err(Status::failed_precondition(reason)),
+            _ => Err(Status::internal(
+                "coordinator core answered a report with no ack",
+            )),
+        }
     }
 }
 
@@ -95,9 +133,69 @@ impl Coordinator for CoordinatorService {
             tool: req.tool,
             tool_input_json: req.tool_input_json,
             intent: req.intent,
+            tool_use_id: req.tool_use_id,
         };
         let admission = self.before_tool(call, now_ms())?;
         Ok(Response::new(to_wire(admission)))
+    }
+
+    async fn after_tool(
+        &self,
+        request: Request<AfterToolReport>,
+    ) -> Result<Response<WireAck>, Status> {
+        let req = request.into_inner();
+        // An unset oneof is a report without a result; it is refused, never taken as success.
+        let result = match req.result {
+            Some(WireResult::Success(success)) => ToolResult::Success {
+                tool_response_json: success.tool_response_json,
+            },
+            // An unset is_interrupt stays None: the hook omitted it, which is not `false`.
+            Some(WireResult::Failure(failure)) => ToolResult::Failure {
+                error_json: failure.error_json,
+                is_interrupt: failure.is_interrupt,
+            },
+            None => {
+                return Err(Status::invalid_argument(
+                    "the AfterTool report has no result",
+                ))
+            }
+        };
+        let report = AfterTool {
+            slot: req.slot,
+            session_id: req.session_id,
+            tool: req.tool,
+            tool_input_json: req.tool_input_json,
+            tool_use_id: req.tool_use_id,
+            result,
+        };
+        self.after_tool(report, now_ms())?;
+        Ok(Response::new(WireAck {}))
+    }
+
+    async fn lifecycle(
+        &self,
+        request: Request<LifecycleReport>,
+    ) -> Result<Response<WireAck>, Status> {
+        let req = request.into_inner();
+        // An unspecified or unknown event is refused, never taken as Stop.
+        let kind = match WireLifecycleEvent::try_from(req.event) {
+            Ok(WireLifecycleEvent::Stop) => LifecycleKind::Stop,
+            Ok(WireLifecycleEvent::SessionEnd) => LifecycleKind::SessionEnd,
+            Ok(WireLifecycleEvent::Unspecified) | Err(_) => {
+                return Err(Status::invalid_argument(format!(
+                    "the lifecycle report names no known event ({})",
+                    req.event
+                )))
+            }
+        };
+        let report = Lifecycle {
+            slot: req.slot,
+            session_id: req.session_id,
+            kind,
+            fields_json: req.fields_json,
+        };
+        self.lifecycle(report, now_ms())?;
+        Ok(Response::new(WireAck {}))
     }
 }
 
@@ -267,15 +365,17 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::identity::CallKey;
     use trace_store::read_events;
 
-    fn call(slot: &str) -> BeforeTool {
+    fn call(slot: &str, session_id: &str, tool_use_id: &str) -> BeforeTool {
         BeforeTool {
             slot: slot.into(),
-            session_id: "s".into(),
+            session_id: session_id.into(),
             tool: "Edit".into(),
             tool_input_json: "{}".into(),
             intent: String::new(),
+            tool_use_id: tool_use_id.into(),
         }
     }
 
@@ -302,15 +402,26 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            svc.before_tool(call("slot-1"), 5).unwrap().verdict,
+            svc.before_tool(call("slot-1", "s", "t1"), 5)
+                .unwrap()
+                .verdict,
             Verdict::Allow
         );
-        let err = svc.before_tool(call("slot-1"), 6).unwrap_err();
+        // A new session's first call fails to append: it must bind nothing and use no identity.
+        let err = svc.before_tool(call("slot-2", "s2", "t2"), 6).unwrap_err();
         assert_eq!(err.code(), tonic::Code::Internal);
 
         let inner = svc.inner.lock().unwrap();
         assert_eq!(inner.state.next_event_id(), 2);
         assert_eq!(inner.state.clock("slot-1").unwrap().entries(), &[1, 0]);
+        assert_eq!(inner.state.clock("slot-2").unwrap().entries(), &[0, 0]);
+        assert_eq!(inner.state.session_slot("s"), Some("slot-1"));
+        assert_eq!(inner.state.session_slot("s2"), None);
+        let failed = CallKey {
+            session_id: "s2".into(),
+            tool_use_id: "t2".into(),
+        };
+        assert_eq!(inner.state.call(&failed), None);
         drop(inner);
         // Only the planted row and the first call's row are in the trace.
         let ids: Vec<u64> = read_events(&tmp.path().join("trace.db"))
@@ -322,10 +433,171 @@ mod tests {
     }
 
     #[test]
+    fn failed_after_tool_append_completes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path(), &["slot-1", "slot-2"]);
+        svc.before_tool(call("slot-1", "s", "t1"), 1).unwrap();
+        let db = rusqlite::Connection::open(tmp.path().join("trace.db")).unwrap();
+        db.execute(
+            "INSERT INTO events (event_id, agent_id, session_id, vclock, kind, wall_time)
+             VALUES (2, 'planted', 'x', x'', 'BeforeTool', 0)",
+            [],
+        )
+        .unwrap();
+        let report = || AfterTool {
+            slot: "slot-1".into(),
+            session_id: "s".into(),
+            tool: "Edit".into(),
+            tool_input_json: "{}".into(),
+            tool_use_id: "t1".into(),
+            result: ToolResult::Success {
+                tool_response_json: "null".into(),
+            },
+        };
+        let key = CallKey {
+            session_id: "s".into(),
+            tool_use_id: "t1".into(),
+        };
+        let err = svc.after_tool(report(), 2).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        {
+            let inner = svc.inner.lock().unwrap();
+            assert_eq!(inner.state.next_event_id(), 2);
+            assert_eq!(inner.state.clock("slot-1").unwrap().entries(), &[1, 0]);
+            assert_eq!(inner.state.call(&key).unwrap().completed_event_id, None);
+        }
+        db.execute_batch("DROP TRIGGER events_no_delete; DELETE FROM events WHERE event_id = 2;")
+            .unwrap();
+        svc.after_tool(report(), 3).unwrap();
+        svc.after_tool(report(), 4).unwrap();
+        let inner = svc.inner.lock().unwrap();
+        let recorded = inner.state.call(&key).unwrap();
+        assert_eq!(
+            (recorded.before_event_id, recorded.completed_event_id),
+            (Some(1), Some(2)),
+            "the retry is the first completion and the repeat does not replace it"
+        );
+        assert_eq!(inner.state.next_event_id(), 4);
+    }
+
+    #[test]
+    fn failed_failure_report_append_completes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path(), &["slot-1", "slot-2"]);
+        svc.before_tool(call("slot-1", "s", "t1"), 1).unwrap();
+        let db = rusqlite::Connection::open(tmp.path().join("trace.db")).unwrap();
+        db.execute(
+            "INSERT INTO events (event_id, agent_id, session_id, vclock, kind, wall_time)
+             VALUES (2, 'planted', 'x', x'', 'BeforeTool', 0)",
+            [],
+        )
+        .unwrap();
+        let report = |result| AfterTool {
+            slot: "slot-1".into(),
+            session_id: "s".into(),
+            tool: "Edit".into(),
+            tool_input_json: "{}".into(),
+            tool_use_id: "t1".into(),
+            result,
+        };
+        let failure = || ToolResult::Failure {
+            error_json: r#""interrupted""#.into(),
+            is_interrupt: Some(true),
+        };
+        let key = CallKey {
+            session_id: "s".into(),
+            tool_use_id: "t1".into(),
+        };
+        let err = svc.after_tool(report(failure()), 2).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        {
+            let inner = svc.inner.lock().unwrap();
+            assert_eq!(inner.state.next_event_id(), 2);
+            assert_eq!(inner.state.clock("slot-1").unwrap().entries(), &[1, 0]);
+            assert_eq!(inner.state.call(&key).unwrap().completed_event_id, None);
+        }
+        db.execute_batch("DROP TRIGGER events_no_delete; DELETE FROM events WHERE event_id = 2;")
+            .unwrap();
+        svc.after_tool(report(failure()), 3).unwrap();
+        let success = ToolResult::Success {
+            tool_response_json: "{}".into(),
+        };
+        svc.after_tool(report(success), 4).unwrap();
+        let inner = svc.inner.lock().unwrap();
+        let recorded = inner.state.call(&key).unwrap();
+        assert_eq!(
+            (recorded.before_event_id, recorded.completed_event_id),
+            (Some(1), Some(2)),
+            "the retried failure is the first completion; a later success does not replace it"
+        );
+        assert_eq!(inner.state.next_event_id(), 4);
+    }
+
+    #[test]
+    fn failed_lifecycle_append_binds_nothing_and_keeps_the_calls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path(), &["slot-1", "slot-2"]);
+        svc.before_tool(call("slot-1", "s", "t1"), 1).unwrap();
+        let db = rusqlite::Connection::open(tmp.path().join("trace.db")).unwrap();
+        db.execute(
+            "INSERT INTO events (event_id, agent_id, session_id, vclock, kind, wall_time)
+             VALUES (2, 'planted', 'x', x'', 'BeforeTool', 0)",
+            [],
+        )
+        .unwrap();
+        let end = |slot: &str, session: &str| Lifecycle {
+            slot: slot.into(),
+            session_id: session.into(),
+            kind: LifecycleKind::SessionEnd,
+            fields_json: r#"{"reason":"other"}"#.into(),
+        };
+        let key = CallKey {
+            session_id: "s".into(),
+            tool_use_id: "t1".into(),
+        };
+        // A new session's first event fails to persist: no id, tick or binding is used.
+        let err = svc.lifecycle(end("slot-2", "s2"), 2).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        {
+            let inner = svc.inner.lock().unwrap();
+            assert_eq!(inner.state.next_event_id(), 2);
+            assert_eq!(inner.state.clock("slot-2").unwrap().entries(), &[0, 0]);
+            assert_eq!(inner.state.session_slot("s2"), None);
+        }
+        db.execute_batch("DROP TRIGGER events_no_delete; DELETE FROM events WHERE event_id = 2;")
+            .unwrap();
+        svc.lifecycle(end("slot-1", "s"), 3).unwrap();
+        // The ended session keeps its slot and its open call: a late completion pairs.
+        let late = AfterTool {
+            slot: "slot-1".into(),
+            session_id: "s".into(),
+            tool: "Edit".into(),
+            tool_input_json: "{}".into(),
+            tool_use_id: "t1".into(),
+            result: ToolResult::Success {
+                tool_response_json: "null".into(),
+            },
+        };
+        svc.after_tool(late, 4).unwrap();
+        let moved = svc.lifecycle(end("slot-2", "s"), 5).unwrap_err();
+        assert_eq!(moved.code(), tonic::Code::FailedPrecondition);
+        let inner = svc.inner.lock().unwrap();
+        let recorded = inner.state.call(&key).unwrap();
+        assert_eq!(
+            (recorded.before_event_id, recorded.completed_event_id),
+            (Some(1), Some(3))
+        );
+        assert_eq!(inner.state.session_slot("s"), Some("slot-1"));
+        assert_eq!(inner.state.session_slot("s2"), None);
+        assert_eq!(inner.state.next_event_id(), 4);
+        assert_eq!(inner.state.clock("slot-1").unwrap().entries(), &[3, 0]);
+    }
+
+    #[test]
     fn unknown_slot_is_denied_without_recording() {
         let tmp = tempfile::tempdir().unwrap();
         let svc = service(tmp.path(), &["slot-1"]);
-        let adm = svc.before_tool(call("nope"), 0).unwrap();
+        let adm = svc.before_tool(call("nope", "s", "t1"), 0).unwrap();
         assert_eq!(adm.verdict, Verdict::Deny);
         assert!(read_events(&tmp.path().join("trace.db"))
             .unwrap()
@@ -423,7 +695,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let run_dir = tmp.path().join("run");
         let svc = service(&run_dir, &["slot-1"]);
-        svc.before_tool(call("slot-1"), 0).unwrap();
+        svc.before_tool(call("slot-1", "s", "t1"), 0).unwrap();
         drop(svc);
         let err = bind(config(tmp.path(), "run")).expect_err("nonempty run refused");
         assert!(

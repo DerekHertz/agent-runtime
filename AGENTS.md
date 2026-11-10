@@ -7,6 +7,10 @@ Rust workspace. Solo project by Derek, implemented by Claude coding agents.
 - `docs/adr/` records hard-to-reverse decisions. Read the relevant ADRs before changing architecture; supersede rather than silently contradict.
 - Each milestone has a "Done when" line in the spec. A milestone is done only when that check passes by running it.
 
+## MVP and scope control
+
+Read [the MVP north star](docs/plans/mvp-north-star.md) and the active issue's acceptance criteria before adding work. Fix reproduced blockers to acceptance, correctness, verification or required CI now. File or reuse GitHub issues for nonblocking findings and defer their implementation. Each PR's Scope section must name the criterion it advances and link deferred findings. Do not start the next issue while the current goal is waiting for Derek's joint review.
+
 ## Agent skills
 
 ### Issue tracker
@@ -39,6 +43,10 @@ Before implementation or review, read `.agents/memory/MEMORY.md` and relevant to
 For every PR, follow pstack's `poteto-mode` Opening a PR playbook. Apply `technical-writing` and then `unslop` to the title, description, and commit body. Use a Conventional Commit title and a one-minute description with `## Why`, `## What changed`, `## Scope`, optional `## Tradeoffs`, `## Blast Radius`, and `## Verification`, in that order. Keep the body under about 40 lines; link detailed evidence instead of pasting execution history.
 
 Keep each PR small enough to review in one sitting. Stack PRs only when a later one truly depends on an earlier one; otherwise open them independently against `main`.
+
+Give Derek a review walkthrough for every PR before asking for his review. Explain the core modules, runtime flow, important tradeoffs, and testing results; skip boilerplate and line-by-line narration. Identify the PR and reviewed head, and update the walkthrough when later changes materially affect it.
+
+After Derek comments, record the walkthrough and review outcome in `docs/reviews/pr-<number>.md`, or append to an existing record for that PR. Include the reviewed head, date, his feedback, decisions, resulting changes, verification results, and unresolved points. Preserve earlier review rounds. Distinguish Derek's feedback from agent findings; do not mark human review complete before he has commented.
 
 1. Claude implements the requested change and runs relevant project checks.
 2. Codex independently reviews the entire task diff and surrounding code without editing files. Findings must include location, trigger, impact, and evidence, checking the spec, ADRs, and shared lessons.

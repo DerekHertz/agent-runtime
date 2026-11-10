@@ -2,7 +2,7 @@
 
 Coherent parallel coding agents: file-level write leases, vector-clock causal tracing, and MPI-shaped collectives (scatter, barrier, gather, allreduce) for N Claude Code sessions on one repository.
 
-Status: M1 in progress. A PreToolUse call reaches the coordinator through the shim and is recorded as a stamped event in `runs/<id>/trace.db`.
+Status: M1 in progress. A PreToolUse call reaches the coordinator through the shim and is recorded as a stamped event in `runs/<id>/trace.db`, and a successful PostToolUse is recorded as an AfterTool paired with it. See [`docs/hook-registration.md`](docs/hook-registration.md) for the hook settings.
 
 ## Checks
 

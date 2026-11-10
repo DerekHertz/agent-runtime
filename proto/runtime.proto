@@ -1,8 +1,8 @@
 // Source of truth for the shim <-> coordinator protocol (docs/SPEC.md section 7).
 //
-// Only the RPC that issue #2 needs is defined here. AfterTool, Release, Attach and the
-// Orchestration service arrive with the issues that implement them, so their message shapes
-// are not guessed ahead of time.
+// Only the RPCs implemented so far are defined here. Release, Attach and the Orchestration
+// service arrive with the issues that implement them, so their message shapes are not guessed
+// ahead of time.
 syntax = "proto3";
 
 package agent_runtime.v1;
@@ -10,6 +10,8 @@ package agent_runtime.v1;
 service Coordinator {
   // Hook path, called by every agent's shim.
   rpc BeforeTool(BeforeToolRequest) returns (Admission);
+  rpc AfterTool(AfterToolReport) returns (Ack);
+  rpc Lifecycle(LifecycleReport) returns (Ack);
 }
 
 // No clocks in shim-facing messages: the coordinator holds every slot's clock (section 5).
@@ -19,6 +21,7 @@ message BeforeToolRequest {
   string tool = 3;            // Edit, Write, NotebookEdit, Read, Bash
   string tool_input_json = 4; // raw hook tool_input; the coordinator core classifies it (paths, Bash class)
   string intent = 5;          // Bash `description` when present, else empty; agents are never prompted for it
+  string tool_use_id = 6;     // hook tool_use_id; with session_id it names the call (pairs it with its AfterTool)
 }
 
 message Admission {
@@ -32,3 +35,54 @@ message Admission {
   string owner = 3;
   string updated_input_json = 4; // set when a Read is redirected to a released snapshot
 }
+
+// A tool call's completion report (PostToolUse or PostToolUseFailure). The coordinator pairs it
+// with the call's BeforeTool by (session_id, tool_use_id). Every field is required: an empty
+// string or an unset `result` is refused, never read as a default.
+message AfterToolReport {
+  string slot = 1;
+  string session_id = 2;
+  string tool = 3;
+  string tool_input_json = 4; // raw hook tool_input reported with the completion
+  string tool_use_id = 5;
+  oneof result {
+    ToolSuccess success = 6;  // PostToolUse
+    ToolFailure failure = 7;  // PostToolUseFailure: the call failed or was interrupted
+  }
+}
+
+// PostToolUse: the tool returned a response.
+message ToolSuccess {
+  string tool_response_json = 1; // raw hook tool_response, any JSON value including `null`
+}
+
+// PostToolUseFailure: the tool call failed, or the user interrupted it.
+message ToolFailure {
+  // Raw hook `error`: the JSON text of a JSON string, so an empty error message is the two
+  // bytes `""`. An empty field is a report without an error and is refused.
+  string error_json = 1;
+  // Hook `is_interrupt`, unset when the hook input omitted it. An omitted flag is never read
+  // as false.
+  optional bool is_interrupt = 2;
+}
+
+// A session's Stop or SessionEnd hook. It names no tool call and releases nothing. Every field is
+// required: an empty slot or session_id, an unspecified event, or an empty fields_json is refused.
+message LifecycleReport {
+  string slot = 1;
+  string session_id = 2;
+  LifecycleEvent event = 3;
+  // The lifecycle fields the hook carried, as a JSON object of their raw values: for Stop
+  // `stop_hook_active` and `last_assistant_message`, for SessionEnd `reason`, each present only
+  // when the hook carried it (`{}` when it carried none). See SPEC section 5.
+  string fields_json = 4;
+}
+
+enum LifecycleEvent {
+  LIFECYCLE_EVENT_UNSPECIFIED = 0; // refused, never read as Stop
+  LIFECYCLE_EVENT_STOP = 1;
+  LIFECYCLE_EVENT_SESSION_END = 2;
+}
+
+// The report was recorded. A refused report is an error status with the reason.
+message Ack {}
