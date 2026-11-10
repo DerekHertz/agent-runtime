@@ -11,8 +11,11 @@ workspace = true
 
 [dependencies]
 blake3.workspace = true
+clock.workspace = true
 rusqlite.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
 tempfile.workspace = true

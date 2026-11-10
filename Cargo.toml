@@ -6,6 +6,7 @@ members = [
     "crates/trace-store",
     "crates/coordinator",
     "crates/shim",
+    "crates/art",
 ]
 # bench/toy is a fixture crate copied into temp dirs per run; it is not a workspace member.
 exclude = ["bench"]
