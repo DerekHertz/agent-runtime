@@ -10,7 +10,7 @@
 //! event). Every accepted report ticks its slot's clock once and records one event; nothing
 //! merges.
 
-use trace_store::{Event, EventKind};
+use trace_store::{Event, Stamp};
 
 use super::{Ack, Output, State};
 
@@ -21,15 +21,6 @@ pub enum LifecycleKind {
     Stop,
     /// SessionEnd: the session ended.
     SessionEnd,
-}
-
-impl LifecycleKind {
-    fn event_kind(self) -> EventKind {
-        match self {
-            LifecycleKind::Stop => EventKind::Stop,
-            LifecycleKind::SessionEnd => EventKind::SessionEnd,
-        }
-    }
 }
 
 /// A Stop or SessionEnd report, as the shim reports it.
@@ -69,22 +60,16 @@ pub(super) fn lifecycle(mut state: State, report: Lifecycle, now: i64) -> (State
         .clocks
         .tick(&report.slot)
         .expect("the slot is in the run: checked above");
-    let event = Event {
+    let stamp = Stamp {
         event_id: state.next_event_id,
         slot: report.slot,
         session_id: report.session_id,
         vclock: stamp.to_bytes(),
-        kind: report.kind.event_kind(),
-        tool: None,
-        path: None,
-        payload_hash: None,
-        payload: Some(report.fields_json),
-        input_payload_hash: None,
-        input_payload: None,
-        tool_use_id: None,
-        before_event_id: None,
-        outcome: None,
         wall_time: now,
+    };
+    let event = match report.kind {
+        LifecycleKind::Stop => Event::stop(stamp, report.fields_json),
+        LifecycleKind::SessionEnd => Event::session_end(stamp, report.fields_json),
     };
     state.next_event_id += 1;
     (

@@ -2,7 +2,7 @@
 //! by `(session_id, tool_use_id)`, and every refusal records nothing and changes nothing.
 
 use clock::Clock;
-use coordinator::core::identity::{Call, CallKey};
+use coordinator::core::identity::{Call, CallKey, CallState};
 use coordinator::core::{step, Admission, BeforeTool, Input, Output, RunConfig, State, Verdict};
 use trace_store::Event;
 
@@ -120,9 +120,10 @@ fn a_repeated_before_tool_is_refused() {
     assert_eq!(
         st.call(&key("sess-a", "toolu_1")),
         Some(&Call {
-            before_event_id: Some(first.event_id),
             tool: "Edit".into(),
-            completed_event_id: None,
+            state: CallState::Open {
+                before_event_id: first.event_id
+            }
         }),
         "the first call stays the recorded one"
     );
@@ -143,7 +144,7 @@ fn equal_tool_use_ids_in_different_sessions_are_different_calls() {
         assert_eq!(
             st.call(&key(session, "toolu_same"))
                 .unwrap()
-                .before_event_id,
+                .before_event_id(),
             Some(id)
         );
     }
@@ -158,11 +159,15 @@ fn overlapping_calls_of_one_session_keep_their_own_before_events() {
     assert_eq!(e1.tool_use_id.as_deref(), Some("toolu_1"));
     assert_eq!(e2.tool_use_id.as_deref(), Some("toolu_2"));
     assert_eq!(
-        st.call(&key("sess-a", "toolu_1")).unwrap().before_event_id,
+        st.call(&key("sess-a", "toolu_1"))
+            .unwrap()
+            .before_event_id(),
         Some(e1.event_id)
     );
     assert_eq!(
-        st.call(&key("sess-a", "toolu_2")).unwrap().before_event_id,
+        st.call(&key("sess-a", "toolu_2"))
+            .unwrap()
+            .before_event_id(),
         Some(e2.event_id)
     );
 }

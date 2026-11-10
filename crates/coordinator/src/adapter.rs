@@ -464,7 +464,7 @@ mod tests {
             let inner = svc.inner.lock().unwrap();
             assert_eq!(inner.state.next_event_id(), 2);
             assert_eq!(inner.state.clock("slot-1").unwrap().entries(), &[1, 0]);
-            assert_eq!(inner.state.call(&key).unwrap().completed_event_id, None);
+            assert_eq!(inner.state.call(&key).unwrap().completed_event_id(), None);
         }
         db.execute_batch("DROP TRIGGER events_no_delete; DELETE FROM events WHERE event_id = 2;")
             .unwrap();
@@ -473,7 +473,7 @@ mod tests {
         let inner = svc.inner.lock().unwrap();
         let recorded = inner.state.call(&key).unwrap();
         assert_eq!(
-            (recorded.before_event_id, recorded.completed_event_id),
+            (recorded.before_event_id(), recorded.completed_event_id()),
             (Some(1), Some(2)),
             "the retry is the first completion and the repeat does not replace it"
         );
@@ -514,7 +514,7 @@ mod tests {
             let inner = svc.inner.lock().unwrap();
             assert_eq!(inner.state.next_event_id(), 2);
             assert_eq!(inner.state.clock("slot-1").unwrap().entries(), &[1, 0]);
-            assert_eq!(inner.state.call(&key).unwrap().completed_event_id, None);
+            assert_eq!(inner.state.call(&key).unwrap().completed_event_id(), None);
         }
         db.execute_batch("DROP TRIGGER events_no_delete; DELETE FROM events WHERE event_id = 2;")
             .unwrap();
@@ -526,7 +526,7 @@ mod tests {
         let inner = svc.inner.lock().unwrap();
         let recorded = inner.state.call(&key).unwrap();
         assert_eq!(
-            (recorded.before_event_id, recorded.completed_event_id),
+            (recorded.before_event_id(), recorded.completed_event_id()),
             (Some(1), Some(2)),
             "the retried failure is the first completion; a later success does not replace it"
         );
@@ -584,7 +584,7 @@ mod tests {
         let inner = svc.inner.lock().unwrap();
         let recorded = inner.state.call(&key).unwrap();
         assert_eq!(
-            (recorded.before_event_id, recorded.completed_event_id),
+            (recorded.before_event_id(), recorded.completed_event_id()),
             (Some(1), Some(3))
         );
         assert_eq!(inner.state.session_slot("s"), Some("slot-1"));
