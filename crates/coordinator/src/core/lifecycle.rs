@@ -60,20 +60,23 @@ pub(super) fn lifecycle(mut state: State, report: Lifecycle, now: i64) -> (State
     {
         return refused(state, refusal.to_string());
     }
-    // The slot's turn or session is over, so it lets go of every file it was writing.
-    if let Some(leases) = &mut state.leases {
-        leases.release_all(&report.slot);
-    }
+
     // Clock rule 1 only: a lifecycle report is an event of its slot, and no knowledge channel.
     let stamp = state
         .clocks
         .tick(&report.slot)
-        .expect("the slot is in the run: checked above");
+        .expect("the slot is in the run: checked above")
+        .to_bytes();
+    // The slot's turn or session is over, so it lets go of every file it was writing. Each
+    // file's release clock is this event's stamp.
+    if let Some(coherence) = &mut state.coherence {
+        coherence.release(&state.clocks, &report.slot);
+    }
     let stamp = Stamp {
         event_id: state.next_event_id,
         slot: report.slot,
         session_id: report.session_id,
-        vclock: stamp.to_bytes(),
+        vclock: stamp,
         wall_time: now,
     };
     let event = match report.kind {
