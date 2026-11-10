@@ -2,10 +2,25 @@
 
 **Status: draft. HUMAN FEEDBACK PENDING.** Derek has not reviewed this PR. Nothing below is his feedback. When he comments, record it in `docs/reviews/pr-<number>.md` once the PR number exists, and keep this draft as the walkthrough presented.
 
-- **Branch:** `codex/issue-3-failed-tools`, PR 5 of the [issue #3 plan](../plans/issue-3.md). Uncommitted author freeze; the chief commits it.
+- **Branch:** `codex/issue-3-failed-tools`, PR 5 of the [issue #3 plan](../plans/issue-3.md). Implementation commit `7d0fe7994d06913e4e48f5a5a8d3a5d4bb7f739a`; later report-only commits retain these verified runtime sources.
 - **Parent and base:** `c2e2a2edbfd2dde2c4ef9126a8b302bab10ae3a0` on `codex/issue-3-after-tool` (PR 4, [its walkthrough](issue-3-after-tool.md)). It stacks on PR 4 because it extends PR 4's `AfterTool` oneof, `core::completion`, `Outcome` and trace schema.
 - **Scope:** PostToolUseFailure only: a failed or interrupted tool call becomes an AfterTool with outcome `failure`. Stop, SessionEnd and the acceptance run are PR 6. No lifecycle events.
 - **Merge hold:** unmerged until Derek has reviewed all issue #3 reports together. The issue stays open.
+
+## Independent chief verification (2026-11-09 Pacific / 2026-11-10 UTC)
+
+**PASS at implementation `7d0fe7994d06913e4e48f5a5a8d3a5d4bb7f739a`.** All 30 runtime source files match their committed Git objects; aggregate SHA256 `5bd62fb1095d6ac24bbe151feca48ebabf65df9432032d9ee295a62cce22bd96`. The task diff stayed unchanged during execution. Hosted results are tracked on this PR's Checks page.
+
+| Check | Verified result |
+| --- | --- |
+| Workspace tests and static checks | **192 Rust tests passed**, including all 29 socket-dependent tests blocked in the author's sandbox. Formatting, Clippy with warnings denied, the 1,000-line cap and whitespace checks pass. |
+| Real-binary verification | **10 journeys, 141 checks passed** through the actual shim, coordinator, Unix sockets, SQLite and blobs. End-of-run sources, receipt and binary hashes match. |
+| Formal verification | **4,492,736 distinct states**, all 10 witnesses reached and all 17 deliberately broken variants caught. Source sync and the actual persistence tests pass. Optional interruption values and payload contents are checked by Rust tests, outside the model's abstraction. |
+| Freshness proof | Baseline PASS/0; source and binary perturbations FAIL/1 after the real journey passes. Originals remain unchanged. |
+| Genuine legacy trace | The issue #2 trace returns its exact original input and absent new metadata, with every database/run-directory byte unchanged. The reader crate matches the source used by the successful probe. An initial external-probe compile error assumed a flat interrupt field; the probe was adapted to the typed Outcome API and rerun. |
+| Reviews and fixture provenance | Native product, journey/model and separate Codex CLI reviews have no remaining findings. The base false-flag fixture matches the recorded M0 e6 event after three path normalizations; true and omitted flags are synthetic variants. No new live comparison was run. |
+
+Reproduce through the [verification skill](../../.agents/skills/verify-agent-runtime/SKILL.md) and [formal skill](../../.agents/skills/formal-verify-admission/SKILL.md). Local raw evidence is gitignored: `.claude/reviews/issue3-pr5-verified/`, `issue3-pr5-legacy/`, `issue3-pr5-fixture-provenance.json` and `issue3-pr5-codex-review.txt`. The author results below describe the earlier sandbox run; this section is the independent local verdict.
 
 ## What it does
 
