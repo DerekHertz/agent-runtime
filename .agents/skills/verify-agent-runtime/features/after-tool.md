@@ -38,6 +38,6 @@ Inputs are the Edit fixtures with only `session_id`, `tool_use_id`, `tool_respon
 
 - A report's refusal is an exit `1`, unlike a PreToolUse refusal, which is a deny decision with exit `0`. Exit `2` on PostToolUse would only feed an error to the model; on Stop it would keep the session from stopping.
 - The hook's PreToolUse and PostToolUse Edit fixtures have different `tool_input` bytes. Pairing never compares inputs; both versions are kept.
-- Only successful completions (PostToolUse) are reported. PostToolUseFailure, Stop and SessionEnd come in later PRs; registering one of them with `--hook-event` exits 1 with "does not report ... yet".
+- This journey covers successful completions (PostToolUse). Failed and interrupted ones (PostToolUseFailure) are the [failed-tool](./failed-tool.md) journey. Stop and SessionEnd come in a later PR; registering one of them with `--hook-event` exits 1 with "does not report ... yet".
 - The 10 s report bound is covered by `crates/shim/tests/cli.rs` (`a_hung_coordinator_ends_the_report_within_its_bound`), not by this journey, which would have to wait 10 s.
 - Hook JSON comes from recorded fixtures with edited fields, not a live Claude Code session.

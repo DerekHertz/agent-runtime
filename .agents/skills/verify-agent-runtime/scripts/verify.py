@@ -15,6 +15,7 @@ import struct, subprocess, sys, tempfile, time, traceback
 
 sys.dont_write_bytecode = True  # importing the journey module must leave no __pycache__ in the skill
 import after_tool  # noqa: E402  the after-tool journey, in its own file (scripts/after_tool.py)
+import failed_tool  # noqa: E402  the failed-tool journey (scripts/failed_tool.py)
 
 SCRIPT = pathlib.Path(__file__).resolve()
 SKILL = SCRIPT.parents[1]
@@ -202,7 +203,8 @@ def doctor_checks(args):
     if bins["art-shim"].is_file():
         r = subprocess.run([str(bins["art-shim"])], input="", capture_output=True, text=True, env=clean_env(), timeout=10)
         add("art-shim with no env exits 0 silently", (r.returncode, r.stdout, r.stderr) == (0, "", ""), f"exit {r.returncode}")
-    fixtures = ("pre_tool_use_edit.json", "pre_tool_use_bash.json", "post_tool_use_edit.json")
+    fixtures = ("pre_tool_use_edit.json", "pre_tool_use_bash.json", "post_tool_use_edit.json",
+                "post_tool_use_failure_bash.json")
     missing = [n for n in fixtures if not (FIXTURES / n).is_file()]
     add("hook fixtures present", not missing, f"missing {missing}" if missing else str(FIXTURES))
     add("python sqlite3 module", bool(sqlite3.sqlite_version), sqlite3.sqlite_version)
@@ -303,7 +305,8 @@ class Ctx:
         self.dir = ev / name
         self.dir.mkdir(parents=True)
         self.n, self.checks, self.commands = 0, [], []
-        self.fixtures = {k: (FIXTURES / f"{k}.json").read_text() for k in ("pre_tool_use_edit", "pre_tool_use_bash", "post_tool_use_edit")}
+        self.fixtures = {k: (FIXTURES / f"{k}.json").read_text()
+                         for k in ("pre_tool_use_edit", "pre_tool_use_bash", "post_tool_use_edit", "post_tool_use_failure_bash")}
 
     def check(self, name, ok, **info):
         self.checks.append({"name": name, "passed": bool(ok), **info})
@@ -384,7 +387,7 @@ class Ctx:
             conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
             try:
                 q = ("SELECT event_id, agent_id, session_id, vclock, kind, tool, path, payload_hash, tool_input, wall_time, "
-                     "tool_use_id, before_event_id, outcome, input_payload_hash FROM events ORDER BY event_id")
+                     "tool_use_id, before_event_id, outcome, input_payload_hash, is_interrupt FROM events ORDER BY event_id")
                 for r in conn.execute(q):
                     n = len(r[3]) // 8
                     source, payload = resolve_payload(run_dir, r[7], r[8])
@@ -394,7 +397,7 @@ class Ctx:
                                  "tool_input": r[8], "payload_source": source, "payload": payload, "wall_time": r[9],
                                  "tool_use_id": r[10], "before_event_id": r[11], "outcome": r[12],
                                  "input_payload_hash": r[13].hex() if r[13] is not None else None,
-                                 "input_payload_source": in_source, "input_payload": in_payload})
+                                 "input_payload_source": in_source, "input_payload": in_payload, "is_interrupt": r[14]})
             finally:
                 conn.close()
         (self.dir / f"trace-{label}.json").write_text(json.dumps({"db": str(db), "rows": rows}, indent=2) + "\n")
@@ -732,6 +735,7 @@ FEATURES = {
     "hook-input": j_hook_input,
     "call-identity": j_call_identity,
     "after-tool": lambda c: after_tool.journey(c, sys.modules[__name__]),
+    "failed-tool": lambda c: failed_tool.journey(c, sys.modules[__name__]),
 }
 
 

@@ -4,8 +4,8 @@
 //! slot variables) it does nothing. Inside a run, its registration (`cli`) fixes how it fails,
 //! before it reads its configuration or stdin: a PreToolUse gate fails closed, so every error,
 //! including a panic, ends in exit 2, because Claude Code lets the tool call proceed on a timeout
-//! or any other non-zero exit code. A PostToolUse report fails with a nonblocking exit 1 and a
-//! reason on stderr, and a recorded report exits 0 silently.
+//! or any other non-zero exit code. A PostToolUse or PostToolUseFailure report fails with a
+//! nonblocking exit 1 and a reason on stderr, and a recorded report exits 0 silently.
 
 mod cli;
 mod config;

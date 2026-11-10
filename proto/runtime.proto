@@ -35,9 +35,9 @@ message Admission {
   string updated_input_json = 4; // set when a Read is redirected to a released snapshot
 }
 
-// A tool call's completion report (PostToolUse). The coordinator pairs it with the call's
-// BeforeTool by (session_id, tool_use_id). Every field is required: an empty string or an unset
-// `result` is refused, never read as a default.
+// A tool call's completion report (PostToolUse or PostToolUseFailure). The coordinator pairs it
+// with the call's BeforeTool by (session_id, tool_use_id). Every field is required: an empty
+// string or an unset `result` is refused, never read as a default.
 message AfterToolReport {
   string slot = 1;
   string session_id = 2;
@@ -45,14 +45,24 @@ message AfterToolReport {
   string tool_input_json = 4; // raw hook tool_input reported with the completion
   string tool_use_id = 5;
   oneof result {
-    ToolSuccess success = 6;
-    // A failed or interrupted call (PostToolUseFailure) arrives with a later field.
+    ToolSuccess success = 6;  // PostToolUse
+    ToolFailure failure = 7;  // PostToolUseFailure: the call failed or was interrupted
   }
 }
 
 // PostToolUse: the tool returned a response.
 message ToolSuccess {
   string tool_response_json = 1; // raw hook tool_response, any JSON value including `null`
+}
+
+// PostToolUseFailure: the tool call failed, or the user interrupted it.
+message ToolFailure {
+  // Raw hook `error`: the JSON text of a JSON string, so an empty error message is the two
+  // bytes `""`. An empty field is a report without an error and is refused.
+  string error_json = 1;
+  // Hook `is_interrupt`, unset when the hook input omitted it. An omitted flag is never read
+  // as false.
+  optional bool is_interrupt = 2;
 }
 
 // The report was recorded. A refused report is an error status with the reason.

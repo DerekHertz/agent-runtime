@@ -166,7 +166,11 @@ fn an_unknown_outcome_is_an_error_not_a_guess() {
         .unwrap();
     let err = read_events(&tmp.path().join(TRACE_FILE)).unwrap_err();
     assert!(
-        matches!(err, Error::UnknownOutcome { event_id: 1, ref outcome } if outcome == "maybe"),
+        matches!(
+            err,
+            Error::UnknownOutcome { event_id: 1, ref outcome, is_interrupt: None }
+                if outcome.as_deref() == Some("maybe")
+        ),
         "{err}"
     );
 }

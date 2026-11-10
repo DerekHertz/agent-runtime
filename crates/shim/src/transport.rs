@@ -1,5 +1,5 @@
 //! The RPCs the shim makes over the coordinator's Unix domain socket: `BeforeTool` for a
-//! PreToolUse gate and `AfterTool` for a PostToolUse report.
+//! PreToolUse gate and `AfterTool` for a PostToolUse or PostToolUseFailure report.
 
 use std::future::Future;
 use std::path::PathBuf;

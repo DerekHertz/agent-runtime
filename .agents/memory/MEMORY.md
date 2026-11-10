@@ -11,3 +11,4 @@ Project contracts live in AGENTS.md, docs/SPEC.md, GLOSSARY.md, and docs/adr/.
 - [Restored sources need touch](restored-sources-need-touch.md) — a file moved back from a backup keeps an old mtime; cargo may test the stale build
 - [Raw JSON null is not absent](raw-json-null-is-not-absent.md) — serde reads null into Option as None; use a `present` deserialize_with when null is a valid value
 - [Verification PASS needs frozen inputs](verification-pass-needs-frozen-inputs.md) — drive's end checks gate PASS; endpoint hashes miss mid-run edit+restore, so freeze while driving
+- [Omitted hook field is not false](omitted-hook-field-is-not-false.md) — keep optional hook fields tri-state: raw parse, proto3 optional, NULL column; test omitted, false, null, wrong type

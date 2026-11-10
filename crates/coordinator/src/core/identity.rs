@@ -23,8 +23,9 @@ pub struct Call {
     /// through its AfterTool (an orphan completion, for example after a PreToolUse timeout).
     pub before_event_id: Option<u64>,
     pub tool: String,
-    /// The event id of the call's first AfterTool, which stays the authoritative completion. A
-    /// later report for the same call is recorded as its own event and changes nothing here.
+    /// The event id of the call's first AfterTool, success or failure, which stays the
+    /// authoritative completion. A later report for the same call, with either outcome, is
+    /// recorded as its own event and changes nothing here.
     pub completed_event_id: Option<u64>,
 }
 

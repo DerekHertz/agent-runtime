@@ -4,15 +4,18 @@
 //! launcher writes, so it is trusted in a way stdin is not: it fixes how the shim fails before
 //! the shim reads its configuration or stdin, or can panic. A PreToolUse gate fails closed
 //! (exit 2), because Claude Code lets a tool call through on any other failure. A report
-//! (PostToolUse) fails with a nonblocking exit 1, because the tool has already run and exit 2
-//! would only feed an error back to the model, or for Stop, keep the session from stopping.
+//! (PostToolUse, PostToolUseFailure) fails with a nonblocking exit 1, because the tool has
+//! already run and exit 2 would only feed an error back to the model, or for Stop, keep the
+//! session from stopping.
 //!
 //! - `art-shim`: the issue #2 registration, a PreToolUse gate. Other events pass through.
 //! - `art-shim --hook-event PreToolUse`: a PreToolUse gate. Any other event is an error.
 //! - `art-shim --hook-event PostToolUse`: a PostToolUse report. Any other event is an error.
+//! - `art-shim --hook-event PostToolUseFailure`: a failed or interrupted call's report. Any other
+//!   event is an error.
 //!
-//! Once `--hook-event` names a report event (PostToolUse, or one a later build handles), every
-//! command-line error is nonblocking, trailing arguments included.
+//! Once `--hook-event` names a report event (PostToolUse, PostToolUseFailure, or one a later
+//! build handles), every command-line error is nonblocking, trailing arguments included.
 
 use std::ffi::OsString;
 
@@ -23,6 +26,7 @@ use crate::hook::Policy;
 pub enum HookEvent {
     PreToolUse,
     PostToolUse,
+    PostToolUseFailure,
 }
 
 impl HookEvent {
@@ -31,13 +35,14 @@ impl HookEvent {
         match self {
             HookEvent::PreToolUse => "PreToolUse",
             HookEvent::PostToolUse => "PostToolUse",
+            HookEvent::PostToolUseFailure => "PostToolUseFailure",
         }
     }
 
     pub fn policy(self) -> Policy {
         match self {
             HookEvent::PreToolUse => Policy::FailClosed,
-            HookEvent::PostToolUse => Policy::Nonblocking,
+            HookEvent::PostToolUse | HookEvent::PostToolUseFailure => Policy::Nonblocking,
         }
     }
 }
@@ -69,7 +74,7 @@ pub struct BadInvocation {
 
 /// Report events later issue #3 PRs handle. Registering one with this build is an error, but a
 /// nonblocking one: a report must never block, whichever build runs it.
-const LATER_REPORT_EVENTS: [&str; 3] = ["PostToolUseFailure", "Stop", "SessionEnd"];
+const LATER_REPORT_EVENTS: [&str; 2] = ["Stop", "SessionEnd"];
 
 /// What the value after `--hook-event` names, read before anything else is checked.
 enum Hint<'a> {
@@ -83,6 +88,7 @@ impl Hint<'_> {
         match value.to_str() {
             Some("PreToolUse") => Hint::Known(HookEvent::PreToolUse),
             Some("PostToolUse") => Hint::Known(HookEvent::PostToolUse),
+            Some("PostToolUseFailure") => Hint::Known(HookEvent::PostToolUseFailure),
             Some(later) if LATER_REPORT_EVENTS.contains(&later) => Hint::LaterReport(later),
             _ => Hint::Unknown,
         }
@@ -161,6 +167,12 @@ mod tests {
         let post = parse_strs(&["--hook-event", "PostToolUse"]).unwrap();
         assert_eq!(post, Invocation::Registered(HookEvent::PostToolUse));
         assert_eq!(post.policy(), Policy::Nonblocking);
+        let failure = parse_strs(&["--hook-event", "PostToolUseFailure"]).unwrap();
+        assert_eq!(
+            failure,
+            Invocation::Registered(HookEvent::PostToolUseFailure)
+        );
+        assert_eq!(failure.policy(), Policy::Nonblocking);
     }
 
     #[test]
@@ -174,7 +186,9 @@ mod tests {
 
     #[test]
     fn trailing_arguments_after_a_report_event_fail_without_blocking() {
-        let reports = ["PostToolUse"].into_iter().chain(LATER_REPORT_EVENTS);
+        let reports = ["PostToolUse", "PostToolUseFailure"]
+            .into_iter()
+            .chain(LATER_REPORT_EVENTS);
         for event in reports {
             for extra in [&["extra"][..], &["--hook-event", "PreToolUse"], &[""]] {
                 let mut args = vec!["--hook-event", event];
@@ -193,6 +207,8 @@ mod tests {
             &["--hook-event", "PreToolUse", "--hook-event", "PostToolUse"],
             &["--hook-event", "Bogus", "extra"],
             &["--hook-event", "posttooluse", "extra"],
+            &["--hook-event", "PostToolUseFailures", "extra"],
+            &["--hook-event", "posttoolusefailure", "extra"],
         ] {
             let err = parse_strs(args).unwrap_err();
             assert_eq!(err.policy, Policy::FailClosed, "{args:?}");

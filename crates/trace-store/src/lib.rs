@@ -8,15 +8,16 @@
 //!
 //! Payloads: an event handed to [`TraceWriter::append`] carries its payload bytes, and the writer
 //! stores them as blobs in `runs/<run-id>/blobs/` and only then inserts the row, which keeps only
-//! their hashes. A BeforeTool's payload is its raw tool input. An AfterTool's payload is its raw
-//! tool response, and the raw tool input reported with it is a second blob named by
-//! `input_payload_hash`, so a completion whose BeforeTool was never recorded still keeps its
-//! input. So a row never names a blob that is missing or not yet flushed; an append whose INSERT
+//! their hashes. A BeforeTool's payload is its raw tool input. A successful AfterTool's payload
+//! is its raw tool response and a failed one's the raw JSON text of its hook `error`; either way
+//! the raw tool input reported with it is a second blob named by `input_payload_hash`, so a
+//! completion whose BeforeTool was never recorded still keeps its input. So a row never names a blob that is missing or not yet flushed; an append whose INSERT
 //! fails can leave orphan blobs, which nothing reads. Traces written before blobs (issue #2) keep
 //! the raw input inline in the `tool_input` column; [`read_payload`] reads either form.
 //!
 //! Columns added after issue #2: `tool_use_id` (issue #3 PR 3), then `before_event_id`, `outcome`
-//! and `input_payload_hash` (issue #3 PR 4, AfterTool). [`read_events`] reads a trace that lacks
+//! and `input_payload_hash` (issue #3 PR 4, AfterTool), then `is_interrupt` (issue #3 PR 5,
+//! failed AfterTool). [`read_events`] reads a trace that lacks
 //! any of them with `None` in its place and never adds a column. A writer adds them only to an
 //! empty trace.
 //!
@@ -84,12 +85,18 @@ impl EventKind {
     }
 }
 
-/// How a tool call ended, as its AfterTool reports it. Only success exists so far; failed and
-/// interrupted calls (PostToolUseFailure) are a later PR.
+/// How a tool call ended, as its AfterTool reports it.
+///
+/// Stored in two columns: `outcome` holds [`Outcome::as_str`], and `is_interrupt` holds a
+/// failure's interruption flag as 1 or 0, or NULL when the report omitted it (and for every
+/// success). The NULL keeps an omitted flag apart from an explicit `false`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     /// PostToolUse: the tool ran and returned a response.
     Success,
+    /// PostToolUseFailure: the call failed or was interrupted. `is_interrupt` is the hook's flag
+    /// as reported, `None` when the hook input did not carry it.
+    Failure { is_interrupt: Option<bool> },
 }
 
 impl Outcome {
@@ -97,12 +104,31 @@ impl Outcome {
     pub fn as_str(self) -> &'static str {
         match self {
             Outcome::Success => "success",
+            Outcome::Failure { .. } => "failure",
         }
     }
 
-    pub fn parse(text: &str) -> Option<Self> {
-        match text {
-            "success" => Some(Outcome::Success),
+    /// The value stored in the `is_interrupt` column: NULL for a success, and for a failure
+    /// whose report omitted the flag.
+    pub fn is_interrupt(self) -> Option<bool> {
+        match self {
+            Outcome::Success => None,
+            Outcome::Failure { is_interrupt } => is_interrupt,
+        }
+    }
+
+    /// The outcome stored as `text` in the `outcome` column and `is_interrupt` in the
+    /// `is_interrupt` column, or `None` when [`TraceWriter::append`] never writes that pair.
+    pub fn from_columns(text: &str, is_interrupt: Option<i64>) -> Option<Self> {
+        let flag = match is_interrupt {
+            None => None,
+            Some(0) => Some(false),
+            Some(1) => Some(true),
+            Some(_) => return None,
+        };
+        match (text, flag) {
+            ("success", None) => Some(Outcome::Success),
+            ("failure", is_interrupt) => Some(Outcome::Failure { is_interrupt }),
             _ => None,
         }
     }
@@ -126,8 +152,9 @@ pub struct Event {
     /// every hash in the trace names a blob the writer stored and flushed first.
     pub payload_hash: Option<Vec<u8>>,
     /// The event's payload, exactly as the shim forwarded it: a BeforeTool's raw hook
-    /// `tool_input` (kept so a run can be re-classified offline, SPEC section 7), an AfterTool's
-    /// raw hook `tool_response`.
+    /// `tool_input` (kept so a run can be re-classified offline, SPEC section 7), a successful
+    /// AfterTool's raw hook `tool_response`, a failed AfterTool's raw hook `error` (the JSON text
+    /// of a string, quotes and escapes included; never a synthesized envelope).
     ///
     /// Given to [`TraceWriter::append`], it is the payload to store: the writer moves it into a
     /// blob and the row keeps only `payload_hash`. Read back with [`read_events`], it is `Some`
@@ -149,8 +176,9 @@ pub struct Event {
     /// coordinator recorded no BeforeTool for it (an orphan completion). `None` for every other
     /// kind and for traces written before the column existed.
     pub before_event_id: Option<u64>,
-    /// For an AfterTool, how the call ended. `None` for every other kind and for traces written
-    /// before the column existed.
+    /// For an AfterTool, how the call ended, with a failure's interruption flag (see
+    /// [`Outcome`]). `None` for every other kind and for traces written before the column
+    /// existed.
     pub outcome: Option<Outcome>,
     /// Milliseconds since the Unix epoch. Display only, never for ordering.
     pub wall_time: i64,
@@ -169,8 +197,14 @@ pub enum Error {
     EventIdRange(u64),
     #[error("trace row {event_id} has unknown event kind {kind:?}")]
     UnknownKind { event_id: i64, kind: String },
-    #[error("trace row {event_id} has unknown outcome {outcome:?}")]
-    UnknownOutcome { event_id: i64, outcome: String },
+    #[error(
+        "trace row {event_id} has unknown outcome {outcome:?} with is_interrupt {is_interrupt:?}"
+    )]
+    UnknownOutcome {
+        event_id: i64,
+        outcome: Option<String>,
+        is_interrupt: Option<i64>,
+    },
     #[error(
         "{path} already holds {events} events; resuming a run is not supported, start a new run id"
     )]
@@ -204,7 +238,8 @@ CREATE TABLE IF NOT EXISTS events (
     tool_use_id        TEXT,
     before_event_id    INTEGER,
     outcome            TEXT,
-    input_payload_hash BLOB
+    input_payload_hash BLOB,
+    is_interrupt       INTEGER
 );
 CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events
 BEGIN SELECT RAISE(ABORT, 'trace is append-only'); END;
@@ -214,11 +249,12 @@ BEGIN SELECT RAISE(ABORT, 'trace is append-only'); END;
 
 /// Nullable columns added after issue #2, in the order they were added, with their types. A
 /// trace written before one of them reads it as NULL; an empty such trace gets it from a writer.
-const LATER_COLUMNS: [(&str, &str); 4] = [
+const LATER_COLUMNS: [(&str, &str); 5] = [
     ("tool_use_id", "TEXT"),
     ("before_event_id", "INTEGER"),
     ("outcome", "TEXT"),
     ("input_payload_hash", "BLOB"),
+    ("is_interrupt", "INTEGER"),
 ];
 
 /// The single writer of a run's trace and its payload blobs. Append-only: there is no update or
@@ -316,8 +352,8 @@ impl TraceWriter {
             "INSERT INTO events
                 (event_id, agent_id, session_id, vclock, kind, tool, path, payload_hash,
                  tool_input, wall_time, tool_use_id, before_event_id, outcome,
-                 input_payload_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, ?11, ?12, ?13)",
+                 input_payload_hash, is_interrupt)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 id,
                 event.slot,
@@ -332,6 +368,7 @@ impl TraceWriter {
                 before_event_id,
                 event.outcome.map(Outcome::as_str),
                 input_payload_hash,
+                event.outcome.and_then(Outcome::is_interrupt),
             ],
         )?;
         Ok(())
@@ -381,12 +418,19 @@ pub fn read_events(db_path: &Path) -> Result<Vec<Event>, Error> {
         let id: i64 = row.get(0)?;
         let kind: String = row.get(4)?;
         let kind = EventKind::parse(&kind).ok_or(Error::UnknownKind { event_id: id, kind })?;
-        let outcome = match row.get::<_, Option<String>>(12)? {
-            Some(text) => Some(Outcome::parse(&text).ok_or(Error::UnknownOutcome {
-                event_id: id,
-                outcome: text,
-            })?),
-            None => None,
+        // A row with no outcome has no interruption flag either; any other pair must be one
+        // `append` writes.
+        let outcome = match (row.get::<_, Option<String>>(12)?, row.get(14)?) {
+            (None, None) => None,
+            (text, is_interrupt) => Some(
+                text.as_deref()
+                    .and_then(|t| Outcome::from_columns(t, is_interrupt))
+                    .ok_or(Error::UnknownOutcome {
+                        event_id: id,
+                        outcome: text,
+                        is_interrupt,
+                    })?,
+            ),
         };
         events.push(Event {
             event_id: id as u64,

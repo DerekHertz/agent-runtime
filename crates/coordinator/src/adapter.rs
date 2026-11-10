@@ -139,6 +139,11 @@ impl Coordinator for CoordinatorService {
             Some(WireResult::Success(success)) => ToolResult::Success {
                 tool_response_json: success.tool_response_json,
             },
+            // An unset is_interrupt stays None: the hook omitted it, which is not `false`.
+            Some(WireResult::Failure(failure)) => ToolResult::Failure {
+                error_json: failure.error_json,
+                is_interrupt: failure.is_interrupt,
+            },
             None => {
                 return Err(Status::invalid_argument(
                     "the AfterTool report has no result",
@@ -435,6 +440,59 @@ mod tests {
             (recorded.before_event_id, recorded.completed_event_id),
             (Some(1), Some(2)),
             "the retry is the first completion and the repeat does not replace it"
+        );
+        assert_eq!(inner.state.next_event_id(), 4);
+    }
+
+    #[test]
+    fn failed_failure_report_append_completes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = service(tmp.path(), &["slot-1", "slot-2"]);
+        svc.before_tool(call("slot-1", "s", "t1"), 1).unwrap();
+        let db = rusqlite::Connection::open(tmp.path().join("trace.db")).unwrap();
+        db.execute(
+            "INSERT INTO events (event_id, agent_id, session_id, vclock, kind, wall_time)
+             VALUES (2, 'planted', 'x', x'', 'BeforeTool', 0)",
+            [],
+        )
+        .unwrap();
+        let report = |result| AfterTool {
+            slot: "slot-1".into(),
+            session_id: "s".into(),
+            tool: "Edit".into(),
+            tool_input_json: "{}".into(),
+            tool_use_id: "t1".into(),
+            result,
+        };
+        let failure = || ToolResult::Failure {
+            error_json: r#""interrupted""#.into(),
+            is_interrupt: Some(true),
+        };
+        let key = CallKey {
+            session_id: "s".into(),
+            tool_use_id: "t1".into(),
+        };
+        let err = svc.after_tool(report(failure()), 2).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        {
+            let inner = svc.inner.lock().unwrap();
+            assert_eq!(inner.state.next_event_id(), 2);
+            assert_eq!(inner.state.clock("slot-1").unwrap().entries(), &[1, 0]);
+            assert_eq!(inner.state.call(&key).unwrap().completed_event_id, None);
+        }
+        db.execute_batch("DROP TRIGGER events_no_delete; DELETE FROM events WHERE event_id = 2;")
+            .unwrap();
+        svc.after_tool(report(failure()), 3).unwrap();
+        let success = ToolResult::Success {
+            tool_response_json: "{}".into(),
+        };
+        svc.after_tool(report(success), 4).unwrap();
+        let inner = svc.inner.lock().unwrap();
+        let recorded = inner.state.call(&key).unwrap();
+        assert_eq!(
+            (recorded.before_event_id, recorded.completed_event_id),
+            (Some(1), Some(2)),
+            "the retried failure is the first completion; a later success does not replace it"
         );
         assert_eq!(inner.state.next_event_id(), 4);
     }

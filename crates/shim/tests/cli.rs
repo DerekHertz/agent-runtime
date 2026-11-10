@@ -19,6 +19,7 @@ use tonic::{transport::Server, Request, Response, Status};
 const EDIT: &str = include_str!("fixtures/pre_tool_use_edit.json");
 const BASH: &str = include_str!("fixtures/pre_tool_use_bash.json");
 const POST: &str = include_str!("fixtures/post_tool_use_edit.json");
+const FAILURE: &str = include_str!("fixtures/post_tool_use_failure_bash.json");
 
 /// Run the shim with `stdin`. `env` is `(slot, socket)`; `None` leaves that variable unset. The
 /// parent's `AGENT_RUNTIME_*` variables are always cleared first.
@@ -28,6 +29,9 @@ fn run_shim(slot: Option<&str>, socket: Option<&Path>, stdin: &str) -> Output {
 
 /// The PostToolUse registration's command line.
 const REPORT: &[&str] = &["--hook-event", "PostToolUse"];
+
+/// The PostToolUseFailure registration's command line.
+const FAILED: &[&str] = &["--hook-event", "PostToolUseFailure"];
 
 /// [`run_shim`] with the registration's arguments, such as [`REPORT`].
 fn run_shim_as(args: &[&str], slot: Option<&str>, socket: Option<&Path>, stdin: &str) -> Output {
@@ -385,6 +389,7 @@ fn the_legacy_registration_lets_other_events_pass_silently() {
     // Without --hook-event the shim is the issue #2 PreToolUse gate only.
     let fake = FakeCoordinator::allow();
     assert_silent(&run_shim(Some("a"), Some(&fake.socket), POST));
+    assert_silent(&run_shim(Some("a"), Some(&fake.socket), FAILURE));
     assert_eq!(fake.calls().len(), 0);
     assert_eq!(fake.reports().len(), 0);
 }
@@ -431,9 +436,107 @@ fn a_post_tool_use_report_is_silent_and_carries_the_raw_input_and_response() {
         );
         match &report.result {
             Some(ReportResult::Success(s)) => assert_eq!(s.tool_response_json, response),
-            None => panic!("the report has no result"),
+            other => panic!("expected a success, got {other:?}"),
         }
     }
+}
+
+/// The failure fixture with `"error":...,"is_interrupt":false` swapped by text for `fields`, so
+/// every other byte stays as recorded.
+fn failure_with(fields: &str) -> String {
+    let start = FAILURE.find(r#""error":"#).unwrap();
+    let end = FAILURE.find(r#","duration_ms""#).unwrap();
+    format!("{}{}{}", &FAILURE[..start], fields, &FAILURE[end..])
+}
+
+#[test]
+fn a_post_tool_use_failure_report_is_silent_and_carries_the_raw_input_error_and_flag() {
+    let fake = FakeCoordinator::allow();
+    let omitted = failure_with("\"error\":\"\"");
+    let interrupted = failure_with(r#""error":"stopped","is_interrupt":true"#);
+    for stdin in [FAILURE, omitted.as_str(), interrupted.as_str()] {
+        assert_silent(&run_shim_as(FAILED, Some("a"), Some(&fake.socket), stdin));
+    }
+    assert_eq!(fake.calls().len(), 0, "a report asks for no admission");
+    let reports = fake.reports();
+    assert_eq!(reports.len(), 3);
+    let hook = parse(FAILURE);
+    let fixture_error =
+        &FAILURE[FAILURE.find(r#""Exit"#).unwrap()..FAILURE.find(r#","is_interrupt""#).unwrap()];
+    let want = [
+        (fixture_error, Some(false)),
+        ("\"\"", None),
+        (r#""stopped""#, Some(true)),
+    ];
+    for (report, (error, flag)) in reports.iter().zip(want) {
+        assert_eq!(report.slot, "a");
+        assert_eq!(report.session_id, hook["session_id"]);
+        assert_eq!(report.tool, "Bash");
+        assert_eq!(report.tool_use_id, hook["tool_use_id"]);
+        assert!(FAILURE.contains(&format!(r#""tool_input":{}"#, report.tool_input_json)));
+        match &report.result {
+            Some(ReportResult::Failure(f)) => {
+                assert_eq!((f.error_json.as_str(), f.is_interrupt), (error, flag));
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_refused_or_unreachable_failure_report_exits_1_not_2() {
+    let fake = FakeCoordinator::start_with(
+        Admission::default(),
+        Some((tonic::Code::FailedPrecondition, Duration::ZERO)),
+    );
+    let out = run_shim_as(FAILED, Some("a"), Some(&fake.socket), FAILURE);
+    assert_report_failed(&out);
+    assert!(
+        stderr(&out).contains("refused by the fake coordinator"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(fake.reports().len(), 1);
+    let dir = socket_dir();
+    let dead = dir.path().join("dead.sock");
+    drop(std::os::unix::net::UnixListener::bind(&dead).expect("bind a Unix socket"));
+    for (slot, socket) in [
+        (Some("a"), Some(dir.path().join("absent.sock"))),
+        (Some("a"), Some(dead)),
+        (Some("a"), None),
+        (None, Some(fake.socket.clone())),
+    ] {
+        assert_report_failed(&run_shim_as(FAILED, slot, socket.as_deref(), FAILURE));
+    }
+    assert_eq!(fake.reports().len(), 1);
+}
+
+#[test]
+fn a_malformed_mistyped_or_mismatched_failure_exits_1_without_contacting_the_coordinator() {
+    let fake = FakeCoordinator::allow();
+    let no_error = failure_with(r#""is_interrupt":false"#);
+    let mut bad = vec![
+        "".to_owned(),
+        "not json".into(),
+        POST.into(),
+        EDIT.into(),
+        no_error,
+    ];
+    for fields in [
+        r#""error":null"#,
+        r#""error":1"#,
+        r#""error":{"message":"x"}"#,
+        r#""error":"x","is_interrupt":null"#,
+        r#""error":"x","is_interrupt":"false""#,
+    ] {
+        bad.push(failure_with(fields));
+    }
+    for stdin in &bad {
+        assert_report_failed(&run_shim_as(FAILED, Some("a"), Some(&fake.socket), stdin));
+    }
+    // The success registration refuses a failure event the same way.
+    assert_report_failed(&run_shim_as(REPORT, Some("a"), Some(&fake.socket), FAILURE));
+    assert_eq!(fake.reports().len() + fake.calls().len(), 0);
 }
 
 #[test]
@@ -502,6 +605,8 @@ fn outside_a_run_a_report_is_silent_and_never_calls_the_coordinator() {
     let fake = FakeCoordinator::allow();
     assert_silent(&run_shim_as(REPORT, None, None, POST));
     assert_silent(&run_shim_as(REPORT, None, None, "not json"));
+    assert_silent(&run_shim_as(FAILED, None, None, FAILURE));
+    assert_silent(&run_shim_as(FAILED, None, None, "not json"));
     // Even a command line this build cannot honour stays silent outside a run.
     assert_silent(&run_shim_as(&["--hook-event", "Bogus"], None, None, POST));
     assert_eq!(fake.reports().len() + fake.calls().len(), 0);

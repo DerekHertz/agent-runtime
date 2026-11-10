@@ -7,7 +7,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use runtime_proto::v1::after_tool_report::Result as ReportResult;
 use runtime_proto::v1::{
-    admission::Verdict, Admission, AfterToolReport, BeforeToolRequest, ToolSuccess,
+    admission::Verdict, Admission, AfterToolReport, BeforeToolRequest, ToolFailure, ToolSuccess,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::value::RawValue;
@@ -32,6 +32,14 @@ struct HookInput {
     #[serde(default, deserialize_with = "present")]
     tool_response: Option<Box<RawValue>>,
     tool_use_id: Option<String>,
+    /// A PostToolUseFailure's raw `error`, which must be a JSON string. Kept raw, and `Some` for
+    /// an explicit `null`, so a wrong type is refused rather than read as absent.
+    #[serde(default, deserialize_with = "present")]
+    error: Option<Box<RawValue>>,
+    /// A PostToolUseFailure's raw `is_interrupt`, which may be omitted but, when present, must
+    /// be `true` or `false`. Kept raw for the same reason as `error`.
+    #[serde(default, deserialize_with = "present")]
+    is_interrupt: Option<Box<RawValue>>,
 }
 
 /// `Some` for any present value, `null` included. A plain `Option<Box<RawValue>>` would read an
@@ -46,7 +54,7 @@ fn present<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Box<RawValue>>, D::
 pub enum Action {
     /// Ask the coordinator about this PreToolUse.
     BeforeTool(BeforeToolRequest),
-    /// Report this PostToolUse to the coordinator.
+    /// Report this PostToolUse or PostToolUseFailure to the coordinator.
     AfterTool(AfterToolReport),
     /// An event the legacy registration (no `--hook-event`) does not handle: exit 0 and print
     /// nothing. That registration is a PreToolUse gate only, so other events pass through
@@ -110,7 +118,44 @@ pub fn parse_input(stdin: &str, slot: &str, invocation: Invocation) -> Result<Ac
                 })),
             }))
         }
+        HookEvent::PostToolUseFailure => {
+            let failure = failure(name, input.error, input.is_interrupt)?;
+            Ok(Action::AfterTool(AfterToolReport {
+                slot: slot.to_owned(),
+                session_id,
+                tool,
+                tool_input_json: tool_input.get().to_owned(),
+                tool_use_id,
+                result: Some(ReportResult::Failure(failure)),
+            }))
+        }
     }
+}
+
+/// A PostToolUseFailure's result. `error` must be present and a JSON string; its raw text is
+/// forwarded unchanged, so an empty message is the JSON `""` and every escape survives.
+/// `is_interrupt` may be omitted, which is forwarded as unset, never as `false`; when present it
+/// must be a boolean. Any other type, `null` included, is refused.
+fn failure(
+    name: &str,
+    error: Option<Box<RawValue>>,
+    is_interrupt: Option<Box<RawValue>>,
+) -> Result<ToolFailure> {
+    let error = error.ok_or_else(|| anyhow!("{name} input has no error"))?;
+    // A raw JSON value starts at its first byte, and only a string starts with a quote.
+    if !error.get().starts_with('"') {
+        bail!("{name} input's error is not a string: {}", error.get());
+    }
+    let is_interrupt = match is_interrupt.as_deref().map(RawValue::get) {
+        None => None,
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        Some(other) => bail!("{name} input's is_interrupt is not a boolean: {other}"),
+    };
+    Ok(ToolFailure {
+        error_json: error.get().to_owned(),
+        is_interrupt,
+    })
 }
 
 /// The agent's stated intent: a Bash call's `description` when it is a string, else empty.
@@ -286,10 +331,12 @@ mod tests {
     const EDIT: &str = include_str!("../tests/fixtures/pre_tool_use_edit.json");
     const BASH: &str = include_str!("../tests/fixtures/pre_tool_use_bash.json");
     const POST: &str = include_str!("../tests/fixtures/post_tool_use_edit.json");
+    const FAILURE: &str = include_str!("../tests/fixtures/post_tool_use_failure_bash.json");
 
     const LEGACY: Invocation = Invocation::Legacy;
     const PRE: Invocation = Invocation::Registered(HookEvent::PreToolUse);
     const REPORT: Invocation = Invocation::Registered(HookEvent::PostToolUse);
+    const FAILED: Invocation = Invocation::Registered(HookEvent::PostToolUseFailure);
 
     fn before_tool(stdin: &str) -> BeforeToolRequest {
         match parse_input(stdin, "a", LEGACY).unwrap() {
@@ -308,8 +355,26 @@ mod tests {
     fn response(report: &AfterToolReport) -> &str {
         match &report.result {
             Some(ReportResult::Success(s)) => &s.tool_response_json,
-            None => panic!("a report always carries its result"),
+            other => panic!("expected a success, got {other:?}"),
         }
+    }
+
+    fn failed(stdin: &str) -> (AfterToolReport, ToolFailure) {
+        match parse_input(stdin, "a", FAILED).unwrap() {
+            Action::AfterTool(r) => match r.result.clone() {
+                Some(ReportResult::Failure(f)) => (r, f),
+                other => panic!("expected a failure result, got {other:?}"),
+            },
+            other => panic!("expected a failure report, got {other:?}"),
+        }
+    }
+
+    /// The failure fixture with `"error":...,"is_interrupt":false` swapped by text for `fields`,
+    /// so every other byte stays as recorded.
+    fn failure_with(fields: &str) -> String {
+        let start = FAILURE.find(r#""error":"#).unwrap();
+        let end = FAILURE.find(r#","duration_ms""#).unwrap();
+        format!("{}{}{}", &FAILURE[..start], fields, &FAILURE[end..])
     }
 
     fn post(tool_response: &str) -> String {
@@ -396,7 +461,7 @@ mod tests {
 
     #[test]
     fn malformed_input_is_an_error() {
-        for invocation in [LEGACY, PRE, REPORT] {
+        for invocation in [LEGACY, PRE, REPORT, FAILED] {
             for bad in ["", "not json", "[]", r#"{"session_id":"s"}"#] {
                 assert!(parse_input(bad, "a", invocation).is_err(), "{bad:?}");
             }
@@ -467,6 +532,113 @@ mod tests {
             let err = parse_input(&v.to_string(), "a", REPORT).unwrap_err();
             assert!(format!("{err:#}").contains(missing), "{err:#}");
         }
+    }
+
+    #[test]
+    fn post_tool_use_failure_reports_the_raw_input_error_and_flag() {
+        let (r, f) = failed(FAILURE);
+        let hook: Value = serde_json::from_str(FAILURE).unwrap();
+        assert_eq!(r.slot, "a");
+        assert_eq!(r.session_id, hook["session_id"]);
+        assert_eq!(r.tool, "Bash");
+        assert_eq!(r.tool_use_id, hook["tool_use_id"]);
+        let want: Value = serde_json::from_str(&r.tool_input_json).unwrap();
+        assert_eq!(want, hook["tool_input"]);
+        assert!(FAILURE.contains(&format!(r#""tool_input":{}"#, r.tool_input_json)));
+        assert!(FAILURE.contains(&format!(r#""error":{}"#, f.error_json)));
+        assert!(
+            f.error_json.starts_with(r#""Exit code 1\n"#),
+            "{}",
+            f.error_json
+        );
+        assert_eq!(f.is_interrupt, Some(false));
+    }
+
+    #[test]
+    fn the_error_text_and_the_interrupt_flag_are_kept_as_reported() {
+        for (fields, error, flag) in [
+            (r#""error":"","is_interrupt":true"#, "\"\"", Some(true)),
+            (
+                r#""error": "a\u00e9\"b\n" ,"is_interrupt":false"#,
+                r#""a\u00e9\"b\n""#,
+                Some(false),
+            ),
+            (r#""error":"interrupted""#, r#""interrupted""#, None),
+        ] {
+            let stdin = failure_with(fields);
+            let (r, f) = failed(&stdin);
+            assert_eq!(
+                (f.error_json.as_str(), f.is_interrupt),
+                (error, flag),
+                "{stdin}"
+            );
+            assert_eq!(r.tool, "Bash");
+        }
+    }
+
+    #[test]
+    fn a_failure_with_a_missing_or_mistyped_field_is_an_error() {
+        for missing in [
+            "session_id",
+            "tool_name",
+            "tool_input",
+            "tool_use_id",
+            "error",
+        ] {
+            let mut v: Value = serde_json::from_str(FAILURE).unwrap();
+            v.as_object_mut().unwrap().remove(missing);
+            let err = parse_input(&v.to_string(), "a", FAILED).unwrap_err();
+            assert!(format!("{err:#}").contains(missing), "{err:#}");
+        }
+        for (fields, named) in [
+            (r#""error":null"#, "error"),
+            (r#""error":1"#, "error"),
+            (r#""error":{"message":"x"}"#, "error"),
+            (r#""error":["x"]"#, "error"),
+            (r#""error":false"#, "error"),
+            (r#""error":"x","is_interrupt":null"#, "is_interrupt"),
+            (r#""error":"x","is_interrupt":"true""#, "is_interrupt"),
+            (r#""error":"x","is_interrupt":1"#, "is_interrupt"),
+        ] {
+            let err = parse_input(&failure_with(fields), "a", FAILED).unwrap_err();
+            assert!(format!("{err:#}").contains(named), "{fields}: {err:#}");
+        }
+        for field in ["session_id", "tool_name", "tool_use_id"] {
+            let mut v: Value = serde_json::from_str(FAILURE).unwrap();
+            v[field] = json!(7);
+            assert!(parse_input(&v.to_string(), "a", FAILED).is_err(), "{field}");
+        }
+        let mut v: Value = serde_json::from_str(FAILURE).unwrap();
+        v["tool_input"] = Value::Null;
+        assert!(
+            parse_input(&v.to_string(), "a", FAILED).is_err(),
+            "null input"
+        );
+    }
+
+    #[test]
+    fn failure_and_success_registrations_take_only_their_own_event() {
+        for (stdin, invocation) in [
+            (FAILURE, REPORT),
+            (POST, FAILED),
+            (EDIT, FAILED),
+            (FAILURE, PRE),
+        ] {
+            let err = parse_input(stdin, "a", invocation).unwrap_err();
+            assert!(format!("{err:#}").contains("registered for"), "{err:#}");
+        }
+        assert_eq!(parse_input(FAILURE, "a", LEGACY).unwrap(), Action::Ignore);
+        // A success ignores error fields, and a failure ignores a tool_response.
+        let post = POST.replace(
+            r#""tool_use_id""#,
+            r#""error":7,"is_interrupt":"x","tool_use_id""#,
+        );
+        assert_eq!(
+            response(&after_tool(&post)),
+            r#"{"filePath":"/work/src/lib.rs"}"#
+        );
+        let with_response = FAILURE.replace(r#""error""#, r#""tool_response":5,"error""#);
+        assert_eq!(failed(&with_response).1.is_interrupt, Some(false));
     }
 
     #[test]

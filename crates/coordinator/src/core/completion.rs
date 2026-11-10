@@ -1,18 +1,21 @@
-//! Completion reports: an AfterTool (PostToolUse) recorded and paired with its call's BeforeTool
-//! (SPEC sections 3 and 5).
+//! Completion reports: an AfterTool (PostToolUse or PostToolUseFailure) recorded and paired with
+//! its call's BeforeTool (SPEC sections 3 and 5).
 //!
 //! A report is paired by `(session_id, tool_use_id)` alone, through [`super::identity`]. Its
 //! input is kept as reported, even when it differs from the BeforeTool's (a hook may have
-//! rewritten it), and the tool response is the event's payload. A report for a call with no
-//! recorded BeforeTool is an orphan: it is recorded with no `before_event_id`, never paired with
-//! a guess. Every accepted report ticks its slot's clock and records one event; nothing merges.
+//! rewritten it). A success's payload is the raw tool response; a failure's is the raw JSON text
+//! of the hook's `error`, and its outcome keeps the interruption flag as reported (omitted stays
+//! `None`). A report for a call with no recorded BeforeTool is an orphan: it is recorded with no
+//! `before_event_id`, never paired with a guess. Success and failure pair the same way, and the
+//! first report of a call is its completion whatever either outcome is. Every accepted report
+//! ticks its slot's clock and records one event; nothing merges.
 
 use trace_store::{Event, EventKind, Outcome};
 
 use super::identity::CallKey;
 use super::{Ack, Output, State};
 
-/// A tool call's completion report (PostToolUse), as the shim reports it.
+/// A tool call's completion report, as the shim reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AfterTool {
     pub slot: String,
@@ -25,12 +28,35 @@ pub struct AfterTool {
     pub result: ToolResult,
 }
 
-/// How the call ended. Failed and interrupted calls (PostToolUseFailure) are a later PR.
+/// How the call ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolResult {
-    /// The tool returned this raw hook `tool_response`, which may be any JSON value, `null`
-    /// included.
+    /// PostToolUse: the tool returned this raw hook `tool_response`, which may be any JSON value,
+    /// `null` included.
     Success { tool_response_json: String },
+    /// PostToolUseFailure: the call failed or was interrupted.
+    Failure {
+        /// The raw JSON text of the hook's `error` string, quotes included, so an empty message
+        /// is the two bytes `""`. An empty field means the sender left the error out.
+        error_json: String,
+        /// The hook's `is_interrupt`, `None` when the hook input omitted it.
+        is_interrupt: Option<bool>,
+    },
+}
+
+impl ToolResult {
+    /// The event's payload, its outcome, and the name of the payload field for a refusal.
+    fn into_parts(self) -> (String, Outcome, &'static str) {
+        match self {
+            ToolResult::Success { tool_response_json } => {
+                (tool_response_json, Outcome::Success, "tool_response")
+            }
+            ToolResult::Failure {
+                error_json,
+                is_interrupt,
+            } => (error_json, Outcome::Failure { is_interrupt }, "error"),
+        }
+    }
 }
 
 fn refused(state: State, reason: impl Into<String>) -> (State, Vec<Output>) {
@@ -49,13 +75,14 @@ pub(super) fn after_tool(mut state: State, report: AfterTool, now: i64) -> (Stat
     if report.tool.is_empty() {
         return refused(state, "the report has no tool");
     }
-    // A raw JSON value is never empty, so an empty string is a field the sender left out.
+    // A raw JSON value is never empty, so an empty string is a field the sender left out. An
+    // empty error message is still the nonempty JSON text `""`.
     if report.tool_input_json.is_empty() {
         return refused(state, "the report has no tool_input");
     }
-    let ToolResult::Success { tool_response_json } = report.result;
-    if tool_response_json.is_empty() {
-        return refused(state, "the report has no tool_response");
+    let (payload, outcome, payload_field) = report.result.into_parts();
+    if payload.is_empty() {
+        return refused(state, format!("the report has no {payload_field}"));
     }
     let key = CallKey {
         session_id: report.session_id.clone(),
@@ -84,12 +111,12 @@ pub(super) fn after_tool(mut state: State, report: AfterTool, now: i64) -> (Stat
         tool: Some(report.tool),
         path: None,
         payload_hash: None,
-        payload: Some(tool_response_json),
+        payload: Some(payload),
         input_payload_hash: None,
         input_payload: Some(report.tool_input_json),
         tool_use_id: Some(report.tool_use_id),
         before_event_id,
-        outcome: Some(Outcome::Success),
+        outcome: Some(outcome),
         wall_time: now,
     };
     state.next_event_id += 1;

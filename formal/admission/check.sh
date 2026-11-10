@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One command that checks the recording path of the coordinator (BeforeTool admissions and AfterTool
-# completion reports): TLC on formal/admission/Admission.tla plus the real-code tests. Run it from anywhere; it works on the checkout it lives in.
+# completion reports, successful and failed): TLC on formal/admission/Admission.tla plus the real-code tests. Run it from anywhere; it works on the checkout it lives in.
 #
 #   formal/admission/check.sh            model + code
 #   formal/admission/check.sh --model    TLC only
@@ -131,7 +131,9 @@ if [ "$want_model" = 1 ]; then
               completion-retry:AdmissionCompletionRetryWitness:CompletionRetryNotReached \
               repeat:AdmissionRepeatWitness:RepeatedCompletionNotReached \
               orphan-completion:AdmissionOrphanCompletionWitness:OrphanCompletionNotReached \
-              out-of-order:AdmissionOutOfOrderWitness:OutOfOrderPairingNotReached; do
+              out-of-order:AdmissionOutOfOrderWitness:OutOfOrderPairingNotReached \
+              failure-retry:AdmissionFailureRetryWitness:FailureRetryNotReached \
+              mixed-outcome:AdmissionMixedOutcomeWitness:MixedOutcomesNotReached; do
     name=${spec%%:*}; rest=${spec#*:}; cfg=${rest%%:*}; inv=${rest#*:}
     tlc "$name-witness" "$cfg.cfg"
     if grep -q "Invariant $inv is violated" "$OUT/$name-witness.log"; then
@@ -151,7 +153,8 @@ if [ "$want_model" = 1 ]; then
               no_repeat_check:CallRecordedOnce identity_before_append:CoreMatchesTrace \
               input_blob_after_row:RowsNameStoredBlobs no_tool_check:CallKeepsItsTool \
               guess_before:AfterPairsWithItsBefore last_completion:CoreMatchesTrace \
-              completion_before_append:CoreMatchesTrace; do
+              completion_before_append:CoreMatchesTrace \
+              failure_as_success:RowKeepsItsOutcome success_only_completion:CoreMatchesTrace; do
     m=${pair%%:*}; rule=${pair##*:}
     tlc "mutant-$m" "mutants/$m.cfg"
     if grep -q "Invariant $rule is violated" "$OUT/mutant-$m.log"; then
@@ -176,15 +179,16 @@ if [ "$want_model" = 1 ]; then
 fi
 
 # ---------------------------------------------------------------------------------------------
-# 3. Real code: the adapter's failed-append unit tests, the admission and the AfterTool tests
+# 3. Real code: the adapter's failed-append unit tests, the admission, AfterTool and failure tests
 # ---------------------------------------------------------------------------------------------
 if [ "$want_code" = 1 ]; then
   mkdir -p "$OUT"
   cd "$ROOT" || exit 2
   if cargo test -p coordinator --lib adapter::tests::failed_ --offline --locked >"$OUT/cargo-lib.log" 2>&1 \
      && grep -q "test adapter::tests::failed_append_keeps_the_old_state ... ok" "$OUT/cargo-lib.log" \
-     && grep -q "test adapter::tests::failed_after_tool_append_completes_nothing ... ok" "$OUT/cargo-lib.log"; then
-    row "PASS  code: adapter::tests::failed_append_keeps_the_old_state, failed_after_tool_append_completes_nothing"
+     && grep -q "test adapter::tests::failed_after_tool_append_completes_nothing ... ok" "$OUT/cargo-lib.log" \
+     && grep -q "test adapter::tests::failed_failure_report_append_completes_nothing ... ok" "$OUT/cargo-lib.log"; then
+    row "PASS  code: adapter::tests::failed_append_keeps_the_old_state, failed_after_tool_append_completes_nothing, failed_failure_report_append_completes_nothing"
   else
     fail=1
     row "FAIL  code: adapter::tests::failed_* (log $OUT/cargo-lib.log)"
@@ -202,6 +206,13 @@ if [ "$want_code" = 1 ]; then
   else
     fail=1
     row "FAIL  code: tests/after_tool_durability.rs: $(grep -E '^test .* FAILED|^error' "$OUT/cargo-after-tool.log" | head -3 | tr '\n' ' ')(log $OUT/cargo-after-tool.log)"
+  fi
+  if cargo test -p coordinator --test failure_durability --offline --locked >"$OUT/cargo-failure.log" 2>&1 \
+     && grep -q "test result: ok. 5 passed" "$OUT/cargo-failure.log"; then
+    row "PASS  code: tests/failure_durability.rs (5 tests)"
+  else
+    fail=1
+    row "FAIL  code: tests/failure_durability.rs: $(grep -E '^test .* FAILED|^error' "$OUT/cargo-failure.log" | head -3 | tr '\n' ' ')(log $OUT/cargo-failure.log)"
   fi
 fi
 

@@ -13,7 +13,8 @@
 (*   Lock          let mut inner = self.inner.lock()                       *)
 (*   Step          core::step(inner.state.clone(), input, now): for a      *)
 (*                 BeforeTool Identities::record_before, for an AfterTool  *)
-(*                 completion::after_tool and Identities::record_after     *)
+(*                 (a success or a failure) completion::after_tool and     *)
+(*                 Identities::record_after                                *)
 (*   BlobOk        inside TraceWriter::append: one self.blobs.put returned *)
 (*                 Ok (the event's payload, or an AfterTool's input)       *)
 (*   BlobFails     that put returned Err: no row is inserted               *)
@@ -30,13 +31,15 @@
 EXTENDS Naturals, Sequences, FiniteSets
 
 CONSTANTS
-    Calls,       \* the calls in flight (two): each one a BeforeTool or an AfterTool
+    Calls,       \* the calls in flight (two): each a BeforeTool or an AfterTool report
     Payloads,    \* the raw tool inputs a call may carry (calls may share one)
     Slots,       \* the slots of the run
     Sessions,    \* the session_ids a call may carry
     UseIds,      \* the tool_use_ids a call may carry
     Tools,       \* the tool names a call may carry
-    Kinds,       \* the kinds a call may be: subset of {"B", "A"} (BeforeTool, AfterTool)
+    Kinds,       \* the kinds a call may be: subset of {"B", "A", "F"} (BeforeTool, an
+                 \* AfterTool of a success (PostToolUse), an AfterTool of a failure
+                 \* (PostToolUseFailure))
     WithGhost,   \* TRUE: a call may name a slot that is not in the run
     WithSeed,    \* TRUE: the run may start with one BeforeTool already recorded
     Mutation     \* "none", or the name of a deliberately broken variant
@@ -51,8 +54,9 @@ Keys == Sessions \X UseIds
 \* (NoTool: the call is unknown), and its first AfterTool's event id (0: not completed).
 NoCall == [before |-> 0, tool |-> NoTool, done |-> 0]
 
-\* An AfterTool's response blob. Each call carries its own response.
+\* An AfterTool's response blob, and a failed AfterTool's error blob. Each call carries its own.
 Resp(k) == "resp-" \o k
+ErrBlob(k) == "err-" \o k
 
 VARIABLES
     slotOf,    \* [Calls -> AllSlots]: the slot each call names (never changes)
@@ -89,17 +93,37 @@ NoOut == [has |-> FALSE, id |-> 0, slot |-> "-", stamp |-> 0, before |-> 0,
 TraceIds == {trace[i].id : i \in DOMAIN trace}
 KeyOf(r) == <<r.session, r.use>>
 
-(* The blob a call's row names as its payload: a BeforeTool's input, an    *)
-(* AfterTool's response.                                                   *)
-PrimaryBlob(k) == IF kindOf[k] = "B" THEN payloadOf[k] ELSE Resp(k)
+\* Whether a call is an AfterTool report, of either outcome. Both are recorded as AfterTool rows
+\* and go through the same pairing and completion code.
+IsAfter(k) == kindOf[k] \in {"A", "F"}
+
+\* The outcome a call's AfterTool row must carry: its report's ("-" for a BeforeTool). The
+\* interruption flag is part of a failure's outcome in the code; it is opaque data here, like the
+\* payload bytes, and its tri-state is checked by the real tests.
+ReportOutcome(k) == CASE kindOf[k] = "B" -> "-"
+                      [] kindOf[k] = "A" -> "success"
+                      [] kindOf[k] = "F" -> "failure"
+
+(* The blob a call's row names as its payload: a BeforeTool's input, a     *)
+(* successful AfterTool's response, a failed AfterTool's raw error.         *)
+PrimaryBlob(k) == CASE kindOf[k] = "B" -> payloadOf[k]
+                    [] kindOf[k] = "A" -> Resp(k)
+                    [] kindOf[k] = "F" -> ErrBlob(k)
+
+(* The outcome the row gets. Broken variant "failure_as_success": a failed  *)
+(* report is recorded as a success (the wire or core mapping drops the      *)
+(* failure).                                                                *)
+RowOutcome(k) == IF kindOf[k] = "F" /\ Mutation = "failure_as_success"
+                 THEN "success" ELSE ReportOutcome(k)
 
 (* The writes TraceWriter::append makes for a recorded event, in order:    *)
-(* "blob" puts the payload, "input" puts an AfterTool's input, "row" is    *)
+(* "blob" puts the payload (a response or an error), "input" puts an       *)
+(* AfterTool's input, "row" is                                             *)
 (* the INSERT. Broken variants: "row_before_blob" inserts first;           *)
 (* "input_blob_after_row" puts an AfterTool's input after its row.         *)
 RowFirst == Mutation = "row_before_blob"
 Writes(k) ==
-    IF kindOf[k] = "B"
+    IF ~IsAfter(k)
     THEN IF RowFirst THEN <<"row", "blob">> ELSE <<"blob", "row">>
     ELSE IF RowFirst THEN <<"row", "blob", "input">>
     ELSE IF Mutation = "input_blob_after_row" THEN <<"blob", "row", "input">>
@@ -123,7 +147,7 @@ SeedTool == CHOOSE t \in Tools : TRUE
 SeedPayload == CHOOSE p \in Payloads : TRUE
 SeedRow == [id |-> 1, slot |-> SeedSlot, stamp |-> 1, call |-> "seed", kind |-> "B",
             blob |-> SeedPayload, inBlob |-> NoBlob, session |-> SeedSession, use |-> SeedUse,
-            tool |-> SeedTool, before |-> 0]
+            tool |-> SeedTool, before |-> 0, outcome |-> "-"]
 
 -----------------------------------------------------------------------------
 Init ==
@@ -175,7 +199,9 @@ Lock(k) ==
 (* the copy: a BeforeTool records the call; an AfterTool pairs with the    *)
 (* call's BeforeTool by identity alone (0 for an orphan, which is then     *)
 (* recorded with no BeforeTool) and becomes the call's completion unless   *)
-(* it already has one. Empty ids are refused by the same checks and are    *)
+(* it already has one, whether it reports a success or a failure. Empty    *)
+(* ids, an empty response and an empty error are refused by the same or    *)
+(* earlier checks and are                                                  *)
 (* not modeled separately. An empty tool is refused before any identity    *)
 (* check (core::before_tool and completion::after_tool), so no call is     *)
 (* recorded with a tool outside Tools, which never holds NoTool.           *)
@@ -183,7 +209,9 @@ Lock(k) ==
 (* records an event for the unknown slot as well; "no_binding_check",      *)
 (* "no_repeat_check" and "no_tool_check" skip one identity check;          *)
 (* "guess_before" pairs an orphan with the latest event; "last_completion" *)
-(* lets a repeated report replace the completion; "identity_before_append" *)
+(* lets a repeated report replace the completion; "success_only_completion"*)
+(* lets only a successful report become the completion, so a failure       *)
+(* leaves the call open; "identity_before_append"                           *)
 (* writes the new binding and calls into inner.state at once, before the   *)
 (* append; "completion_before_append" does so for an AfterTool's calls     *)
 (* only.                                                                   *)
@@ -192,7 +220,7 @@ Step(k) ==
     /\ LET s == slotOf[k]
            x == sessionOf[k]
            c == <<x, useIdOf[k]>>
-           isAfter == kindOf[k] = "A"
+           isAfter == IsAfter(k)
            known == s \in Slots
            recorded == calls[c].tool # NoTool
            sameSlot == bound[x] \in {NoSlot, s} \/ Mutation = "no_binding_check"
@@ -204,7 +232,9 @@ Step(k) ==
                       ELSE IF Mutation = "no_tick" THEN clk[s] ELSE clk[s] + 1
            pairs == IF recorded THEN calls[c].before
                     ELSE IF Mutation = "guess_before" THEN nextId - 1 ELSE 0
-           doneOf == IF calls[c].done = 0 \/ Mutation = "last_completion"
+           doneOf == IF Mutation = "success_only_completion" /\ kindOf[k] = "F"
+                     THEN calls[c].done
+                     ELSE IF calls[c].done = 0 \/ Mutation = "last_completion"
                      THEN nextId ELSE calls[c].done
            newCall == IF isAfter
                       THEN [before |-> pairs, tool |-> toolOf[k], done |-> doneOf]
@@ -301,11 +331,13 @@ AppendOk(k) ==
     /\ NextWrite(k) = "row"
     /\ out[k].id \notin TraceIds
     /\ trace' = Append(trace, [id |-> out[k].id, slot |-> out[k].slot,
-                               stamp |-> out[k].stamp, call |-> k, kind |-> kindOf[k],
+                               stamp |-> out[k].stamp, call |-> k,
+                               kind |-> IF IsAfter(k) THEN "A" ELSE "B",
                                blob |-> PrimaryBlob(k),
-                               inBlob |-> IF kindOf[k] = "A" THEN payloadOf[k] ELSE NoBlob,
+                               inBlob |-> IF IsAfter(k) THEN payloadOf[k] ELSE NoBlob,
                                session |-> sessionOf[k], use |-> useIdOf[k],
-                               tool |-> toolOf[k], before |-> out[k].before])
+                               tool |-> toolOf[k], before |-> out[k].before,
+                               outcome |-> RowOutcome(k)])
     /\ Advance(k)
     /\ UNCHANGED <<given, blobs, holder, core, out, reply, injected>>
 
@@ -484,6 +516,12 @@ CallKeepsItsTool ==
     \A i, j \in DOMAIN trace :
         KeyOf(trace[i]) = KeyOf(trace[j]) => trace[i].tool = trace[j].tool
 
+(* (i) Every row carries its report's outcome: a failure is never recorded  *)
+(* as a success, nor a success as a failure. (The seed row is a BeforeTool.)*)
+RowKeepsItsOutcome ==
+    \A i \in DOMAIN trace :
+        trace[i].call # "seed" => trace[i].outcome = ReportOutcome(trace[i].call)
+
 (* (h) An AfterTool row names its own call's BeforeTool row when there is   *)
 (* one, by identity alone, and no row (0) when there is none: never a guess.*)
 AfterPairsWithItsBefore ==
@@ -569,5 +607,33 @@ OutOfOrderPairingReached ==
         /\ trace[i].kind = "A" /\ trace[j].kind = "B"
         /\ trace[i].before # 0 /\ trace[j].id > trace[i].before
 OutOfOrderPairingNotReached == ~OutOfOrderPairingReached
+
+(* A failure report failed to persist, and its retry was recorded with the  *)
+(* failed report's id, as a failure, still paired with the call's           *)
+(* BeforeTool.                                                              *)
+FailedFailureRetriedAndPaired ==
+    \E k1, k2 \in Calls :
+        /\ k1 # k2
+        /\ kindOf[k1] = "F" /\ kindOf[k2] = "F"
+        /\ reply[k1] = "Err" /\ reply[k2] = "Ack"
+        /\ <<sessionOf[k1], useIdOf[k1]>> = <<sessionOf[k2], useIdOf[k2]>>
+        /\ \E i \in DOMAIN trace :
+             /\ trace[i].call = k2 /\ trace[i].id = out[k1].id /\ trace[i].before # 0
+             /\ trace[i].outcome = "failure"
+FailureRetryNotReached == ~FailedFailureRetriedAndPaired
+
+(* Two AfterTool rows of one call with different outcomes (a success after  *)
+(* a failure, or a failure after a success), both naming the same           *)
+(* BeforeTool, with every call answered: rule (c) then requires the first   *)
+(* to stay the call's completion.                                           *)
+MixedOutcomesReached ==
+    \E i, j \in DOMAIN trace :
+        /\ i < j
+        /\ trace[i].kind = "A" /\ trace[j].kind = "A"
+        /\ KeyOf(trace[i]) = KeyOf(trace[j])
+        /\ trace[i].outcome # trace[j].outcome
+        /\ trace[i].before # 0 /\ trace[i].before = trace[j].before
+        /\ \A k \in Calls : pc[k] = "done"
+MixedOutcomesNotReached == ~MixedOutcomesReached
 
 =============================================================================
