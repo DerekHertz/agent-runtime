@@ -9,3 +9,6 @@ bench/m0/runs/
 .claude/settings.local.json
 .claude/reviews/
 .claude/worktrees/
+
+# Run directories written by `art run`
+/runs/
