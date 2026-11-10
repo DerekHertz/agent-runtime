@@ -7,6 +7,10 @@ Rust workspace. Solo project by Derek, implemented by Claude coding agents.
 - `docs/adr/` records hard-to-reverse decisions. Read the relevant ADRs before changing architecture; supersede rather than silently contradict.
 - Each milestone has a "Done when" line in the spec. A milestone is done only when that check passes by running it.
 
+## MVP and scope control
+
+Read [the MVP north star](docs/plans/mvp-north-star.md) and the active issue's acceptance criteria before adding work. Fix reproduced blockers to acceptance, correctness, verification or required CI now. File or reuse GitHub issues for nonblocking findings and defer their implementation. Each PR's Scope section must name the criterion it advances and link deferred findings. Do not start the next issue while the current goal is waiting for Derek's joint review.
+
 ## Agent skills
 
 ### Issue tracker
