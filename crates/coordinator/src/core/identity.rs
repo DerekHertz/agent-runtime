@@ -38,6 +38,9 @@ pub enum CallState {
         before_event_id: Option<u64>,
         completed_event_id: u64,
     },
+    /// The call was refused for a lease and recorded as the Deny `deny_event_id`. Its tool never
+    /// runs, so it never completes; a report that names it anyway is recorded as an orphan.
+    Denied { deny_event_id: u64 },
 }
 
 impl Call {
@@ -48,13 +51,14 @@ impl Call {
             CallState::Completed {
                 before_event_id, ..
             } => before_event_id,
+            CallState::Denied { .. } => None,
         }
     }
 
     /// The event id of the call's first AfterTool, `None` while the call is open.
     pub fn completed_event_id(&self) -> Option<u64> {
         match self.state {
-            CallState::Open { .. } => None,
+            CallState::Open { .. } | CallState::Denied { .. } => None,
             CallState::Completed {
                 completed_event_id, ..
             } => Some(completed_event_id),
@@ -88,17 +92,35 @@ pub enum Refusal {
     },
 }
 
-/// Session-to-slot bindings and the calls recorded so far.
+/// Where a session stands in its life. A session is `Active` from its first tool call, `Stopped`
+/// after its Stop (its turn is over), and `Ended` after its SessionEnd. A tool call from a
+/// stopped or ended session makes it `Active` again: a new turn, or a resumed session. Its slot
+/// never changes, whatever the phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionPhase {
+    Active,
+    Stopped,
+    Ended,
+}
+
+/// A session the run has seen: the slot of its first recorded event, and its phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Session {
+    pub slot: String,
+    pub phase: SessionPhase,
+}
+
+/// The run's sessions and the calls recorded so far.
 #[derive(Debug, Clone, Default)]
 pub struct Identities {
-    slot_of: HashMap<String, String>,
+    sessions: HashMap<String, Session>,
     calls: HashMap<CallKey, Call>,
 }
 
 impl Identities {
     /// Record a BeforeTool's identity for `slot`, which the caller has checked is in the run, as
-    /// event `event_id`. Binds the session on its first event. All or nothing: on `Err` nothing
-    /// has changed.
+    /// event `event_id`. Binds the session on its first event and makes it active. All or
+    /// nothing: on `Err` nothing has changed.
     pub fn record_before(
         &mut self,
         slot: &str,
@@ -106,19 +128,51 @@ impl Identities {
         event_id: u64,
         tool: &str,
     ) -> Result<(), Refusal> {
-        self.check_session(slot, &key)?;
-        if self.calls.contains_key(&key) {
+        let state = CallState::Open {
+            before_event_id: event_id,
+        };
+        self.record_call(slot, key, tool, state)
+    }
+
+    /// Record a call refused for a lease, as the Deny `event_id`. Checked and bound exactly like
+    /// a BeforeTool, so a repeat of the denied call is refused as a repeat.
+    pub fn record_denied(
+        &mut self,
+        slot: &str,
+        key: CallKey,
+        event_id: u64,
+        tool: &str,
+    ) -> Result<(), Refusal> {
+        let state = CallState::Denied {
+            deny_event_id: event_id,
+        };
+        self.record_call(slot, key, tool, state)
+    }
+
+    /// Whether a new call `key` from `slot` would be recorded, without recording it.
+    pub fn check_new_call(&self, slot: &str, key: &CallKey) -> Result<(), Refusal> {
+        self.check_session(slot, key)?;
+        if self.calls.contains_key(key) {
             return Err(Refusal::Repeated {
-                session_id: key.session_id,
-                tool_use_id: key.tool_use_id,
+                session_id: key.session_id.clone(),
+                tool_use_id: key.tool_use_id.clone(),
             });
         }
-        self.bind(slot, &key.session_id);
+        Ok(())
+    }
+
+    fn record_call(
+        &mut self,
+        slot: &str,
+        key: CallKey,
+        tool: &str,
+        state: CallState,
+    ) -> Result<(), Refusal> {
+        self.check_new_call(slot, &key)?;
+        self.bind(slot, &key.session_id).phase = SessionPhase::Active;
         let call = Call {
             tool: tool.to_owned(),
-            state: CallState::Open {
-                before_event_id: event_id,
-            },
+            state,
         };
         self.calls.insert(key, call);
         Ok(())
@@ -165,15 +219,20 @@ impl Identities {
         Ok(call.before_event_id())
     }
 
-    /// Record a lifecycle report's (Stop or SessionEnd) session for `slot`, which the caller has
-    /// checked is in the run: refuse an empty or rebound session, else bind it on its first
-    /// event. A lifecycle report names no call, so the recorded calls, their completions and every
-    /// binding stay as they are: a SessionEnd does not unbind its session or forget its calls, so
-    /// a late completion still pairs and the session cannot move to another slot. All or nothing:
-    /// on `Err` nothing has changed.
-    pub fn record_lifecycle(&mut self, slot: &str, session_id: &str) -> Result<(), Refusal> {
+    /// Record a lifecycle report's session for `slot`, which the caller has checked is in the
+    /// run, and move the session to `phase` (`Stopped` or `Ended`): refuse an empty or rebound
+    /// session, else bind it on its first event. A lifecycle report names no call, so the
+    /// recorded calls, their completions and every binding stay as they are: a SessionEnd does
+    /// not unbind its session or forget its calls, so a late completion still pairs and the
+    /// session cannot move to another slot. All or nothing: on `Err` nothing has changed.
+    pub fn record_lifecycle(
+        &mut self,
+        slot: &str,
+        session_id: &str,
+        phase: SessionPhase,
+    ) -> Result<(), Refusal> {
         self.check_slot(slot, session_id)?;
-        self.bind(slot, session_id);
+        self.bind(slot, session_id).phase = phase;
         Ok(())
     }
 
@@ -193,24 +252,33 @@ impl Identities {
         if session_id.is_empty() {
             return Err(Refusal::EmptySession);
         }
-        match self.slot_of.get(session_id) {
-            Some(bound) if bound != slot => Err(Refusal::OtherSlot {
+        match self.sessions.get(session_id) {
+            Some(bound) if bound.slot != slot => Err(Refusal::OtherSlot {
                 session_id: session_id.to_owned(),
-                bound: bound.clone(),
+                bound: bound.slot.clone(),
             }),
             _ => Ok(()),
         }
     }
 
-    fn bind(&mut self, slot: &str, session_id: &str) {
-        self.slot_of
+    /// The session, bound to `slot` as active if this is its first event.
+    fn bind(&mut self, slot: &str, session_id: &str) -> &mut Session {
+        self.sessions
             .entry(session_id.to_owned())
-            .or_insert_with(|| slot.to_owned());
+            .or_insert_with(|| Session {
+                slot: slot.to_owned(),
+                phase: SessionPhase::Active,
+            })
     }
 
     /// The slot a session is bound to, or `None` before its first recorded event.
     pub fn slot_of(&self, session_id: &str) -> Option<&str> {
-        self.slot_of.get(session_id).map(String::as_str)
+        self.session(session_id).map(|s| s.slot.as_str())
+    }
+
+    /// A session the run has seen, or `None` before its first recorded event.
+    pub fn session(&self, session_id: &str) -> Option<&Session> {
+        self.sessions.get(session_id)
     }
 
     pub fn call(&self, key: &CallKey) -> Option<&Call> {

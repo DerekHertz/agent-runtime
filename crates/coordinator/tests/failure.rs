@@ -14,6 +14,7 @@ use trace_store::{Event, EventKind, Outcome};
 fn state() -> State {
     State::new(&RunConfig {
         slots: vec!["slot-1".into(), "slot-2".into()],
+        leases: false,
     })
     .unwrap()
 }

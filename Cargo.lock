@@ -236,6 +236,7 @@ dependencies = [
  "hyper-util",
  "runtime-proto",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",

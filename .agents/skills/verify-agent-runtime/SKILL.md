@@ -104,4 +104,5 @@ Each drive uses its own run id dir and socket, so concurrent harness runs on dif
 - `scripts/failed_tool.py`: the `failed-tool` journey (PostToolUseFailure), kept apart the same way.
 - `scripts/lifecycle.py`: the `lifecycle` journey (Stop and SessionEnd), kept apart the same way.
 - `scripts/launcher.py`: the `launcher` journey (`art run` and `art query`), kept apart the same way. `scripts/fake_agent.py` is the stand-in agent it starts in place of `claude`.
+- `scripts/leases.py`: the `leases` journey (a write denied for a lease, and its release), kept apart the same way.
 - `features/`: the maintained feature map. Add a feature file and a `FEATURES` entry in `verify.py` together.

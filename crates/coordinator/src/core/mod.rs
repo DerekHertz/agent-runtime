@@ -17,15 +17,19 @@ use std::collections::HashSet;
 
 use trace_store::{Event, Stamp};
 
+use classification::Access;
 use clocks::Clocks;
 pub use completion::{AfterTool, ToolResult};
-use identity::{Call, CallKey, Identities};
+use identity::{Call, CallKey, Identities, Session};
+use leases::Leases;
 pub use lifecycle::{Lifecycle, LifecycleKind};
 
 /// The fixed set of slots a run is started with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunConfig {
     pub slots: Vec<String>,
+    /// Whether writes take leases (SPEC section 4). Off, every call is allowed.
+    pub leases: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -61,6 +65,8 @@ impl RunConfig {
 pub struct State {
     clocks: Clocks,
     identities: Identities,
+    /// `None` when the run takes no leases: every call is then allowed.
+    leases: Option<Leases>,
     next_event_id: u64,
 }
 
@@ -71,6 +77,7 @@ impl State {
         Ok(Self {
             clocks: Clocks::new(&config.slots),
             identities: Identities::default(),
+            leases: config.leases.then(Leases::default),
             next_event_id: 1,
         })
     }
@@ -87,6 +94,17 @@ impl State {
     /// The slot a session is bound to, or `None` before its first recorded event.
     pub fn session_slot(&self, session_id: &str) -> Option<&str> {
         self.identities.slot_of(session_id)
+    }
+
+    /// A session the run has seen, with its phase.
+    pub fn session(&self, session_id: &str) -> Option<&Session> {
+        self.identities.session(session_id)
+    }
+
+    /// The slot holding the lease on `path`, if any.
+    pub fn lease_holder(&self, path: &str) -> Option<&str> {
+        let lease = self.leases.as_ref()?.on(path)?;
+        Some(lease.holder.as_str())
     }
 
     /// A recorded call, by its `(session_id, tool_use_id)`.
@@ -173,6 +191,14 @@ impl Admission {
             updated_input_json: String::new(),
         }
     }
+
+    /// A Deny because `owner` holds the lease the call needs.
+    pub fn deny_for_lease(reason: impl Into<String>, owner: impl Into<String>) -> Self {
+        Self {
+            owner: owner.into(),
+            ..Self::deny(reason)
+        }
+    }
 }
 
 /// Advance the coordinator by one input at wall time `now` (milliseconds since the Unix epoch,
@@ -181,7 +207,10 @@ impl Admission {
 ///
 /// A refused input (unknown slot, empty tool, empty or rebound session, empty or repeated
 /// `tool_use_id`, an AfterTool naming another tool than its call, a lifecycle report without its
-/// fields) gets a Deny or a refused Ack, no `Record`, and the state back unchanged. The adapter
+/// fields) gets a Deny or a refused Ack, no `Record`, and the state back unchanged. A write
+/// denied for a lease is not a refused input: it is recorded as a `Deny` event, ticks its slot
+/// and is answered with a Deny that names the holder. A Stop or SessionEnd releases every lease
+/// its slot holds. The adapter
 /// commits the returned state only after the `Record` is appended, so a failed append binds no
 /// session, uses no call identity and completes no call. A Stop or SessionEnd changes no call,
 /// completion or binding other than binding its own session on its first event.
@@ -210,16 +239,35 @@ fn before_tool(mut state: State, call: BeforeTool, now: i64) -> (State, Vec<Outp
         session_id: call.session_id.clone(),
         tool_use_id: call.tool_use_id.clone(),
     };
-    let event_id = state.next_event_id;
-    if let Err(refusal) = state
-        .identities
-        .record_before(&call.slot, key, event_id, &call.tool)
-    {
+    if let Err(refusal) = state.identities.check_new_call(&call.slot, &key) {
         return (
             state,
             vec![Output::Admit(Admission::deny(refusal.to_string()))],
         );
     }
+    let access = classification::classify(&call.tool, &call.tool_input_json);
+    // A write needs the file's lease. The claim is made on the copy of the state, so a failed
+    // append leaves the table as it was.
+    let denied = match (&mut state.leases, &access) {
+        (Some(leases), Access::Write { path }) => leases
+            .claim(path, &call.slot, &call.intent, now)
+            .err()
+            .map(|lease| {
+                let reason = leases::deny_reason(path, lease, now);
+                (path.clone(), reason, lease.holder.clone())
+            }),
+        _ => None,
+    };
+    let event_id = state.next_event_id;
+    let recorded = match &denied {
+        Some(_) => state
+            .identities
+            .record_denied(&call.slot, key, event_id, &call.tool),
+        None => state
+            .identities
+            .record_before(&call.slot, key, event_id, &call.tool),
+    };
+    recorded.expect("the call is new: checked above");
     // Clock rule 1 only. Nothing merges here: ADR 0002, clocks cross only through knowledge
     // channels. A new session of a slot continues that slot's clock.
     let stamp = state
@@ -233,19 +281,29 @@ fn before_tool(mut state: State, call: BeforeTool, now: i64) -> (State, Vec<Outp
         vclock: stamp.to_bytes(),
         wall_time: now,
     };
-    let path = classification::classify(&call.tool, &call.tool_input_json)
-        .path()
-        .map(str::to_owned);
-    let event = Event::before_tool(
-        stamp,
-        call.tool,
-        call.tool_use_id,
-        call.tool_input_json,
-        path,
-    );
     state.next_event_id += 1;
-    (
-        state,
-        vec![Output::Record(event), Output::Admit(Admission::allow())],
-    )
+    let (event, admission) = match denied {
+        Some((path, reason, owner)) => (
+            Event::deny(
+                stamp,
+                call.tool,
+                call.tool_use_id,
+                path,
+                call.tool_input_json,
+                &reason,
+            ),
+            Admission::deny_for_lease(reason, owner),
+        ),
+        None => (
+            Event::before_tool(
+                stamp,
+                call.tool,
+                call.tool_use_id,
+                call.tool_input_json,
+                access.path().map(str::to_owned),
+            ),
+            Admission::allow(),
+        ),
+    };
+    (state, vec![Output::Record(event), Output::Admit(admission)])
 }

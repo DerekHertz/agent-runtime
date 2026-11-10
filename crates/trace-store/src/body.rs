@@ -32,6 +32,13 @@ pub enum Body<'a> {
         /// before the coordinator classified calls.
         path: Option<&'a str>,
     },
+    /// A write refused because another slot holds the lease on `path`. The payload is the reason
+    /// given to the agent, as JSON text of a string; the input payload is the raw tool input.
+    Deny {
+        tool: &'a str,
+        tool_use_id: &'a str,
+        path: &'a str,
+    },
     /// A completed tool call. `before_event_id` is `None` for an orphan completion.
     AfterTool {
         tool: &'a str,
@@ -100,6 +107,26 @@ impl Event {
         }
     }
 
+    /// A Deny to append: the write of `path` that was refused, with the `reason` the agent was
+    /// given (stored as JSON text of a string) and the raw `tool_input` of the call.
+    pub fn deny(
+        stamp: Stamp,
+        tool: String,
+        tool_use_id: String,
+        path: String,
+        tool_input: String,
+        reason: &str,
+    ) -> Event {
+        let reason = serde_json::Value::String(reason.to_owned()).to_string();
+        Event {
+            tool: Some(tool),
+            tool_use_id: Some(tool_use_id),
+            path: Some(path),
+            input_payload: Some(tool_input),
+            ..Event::blank(stamp, EventKind::Deny, reason)
+        }
+    }
+
     /// An AfterTool to append. `result` is the raw `tool_response` of a success or the raw
     /// `error` of a failure, and `tool_input` is the input the report carried.
     pub fn after_tool(
@@ -160,6 +187,21 @@ impl Event {
                     tool: self.tool.as_deref().ok_or(missing("tool"))?,
                     tool_use_id: self.tool_use_id.as_deref(),
                     path: self.path.as_deref(),
+                })
+            }
+            EventKind::Deny => {
+                for (column, set) in [
+                    ("before_event_id", self.before_event_id.is_some()),
+                    ("outcome", self.outcome.is_some()),
+                ] {
+                    if set {
+                        return Err(foreign(column));
+                    }
+                }
+                Ok(Body::Deny {
+                    tool: self.tool.as_deref().ok_or(missing("tool"))?,
+                    tool_use_id: self.tool_use_id.as_deref().ok_or(missing("tool_use_id"))?,
+                    path: self.path.as_deref().ok_or(missing("path"))?,
                 })
             }
             EventKind::AfterTool => Ok(Body::AfterTool {

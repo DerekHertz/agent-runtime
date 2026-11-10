@@ -26,7 +26,7 @@ Each rung is one small PR that ends in a check someone can run. A rung is climbe
 | 5 | [#6](https://github.com/DerekHertz/agent-runtime/issues/6) Launcher | `art run` with a two-slot run file puts both sessions' hook events in one trace | climbed 2026-11-10 with a stand-in agent; a live session is rung 6 |
 | 6 | [#7](https://github.com/DerekHertz/agent-runtime/issues/7) **M1 run** (Derek starts it) | Goal check 1 | not started |
 | 7 | Classify the file each Edit, Write, NotebookEdit and Read names, in the core, and record it in `path` (the part of [#5](https://github.com/DerekHertz/agent-runtime/issues/5) the leases need) | A recorded BeforeTool carries its file; `Run` uses it | climbed 2026-11-10 |
-| 8 | [#8](https://github.com/DerekHertz/agent-runtime/issues/8) Leases with Deny, with the session as an explicit state machine that releases on Stop and SessionEnd | Two slots write one file: the second is denied and the Deny is in the trace | not started |
+| 8 | [#8](https://github.com/DerekHertz/agent-runtime/issues/8) Leases with Deny, with the session as an explicit state machine that releases on Stop and SessionEnd | Two slots write one file: the second is denied and the Deny is in the trace | climbed 2026-11-10 |
 | 8b | Invalidation on release and the two knowledge channels of [#5](https://github.com/DerekHertz/agent-runtime/issues/5): Read absorbs the file's release clock, Deny absorbs the holder's lease clock | A Read after another slot's write and release orders that write before the reader's next event | not started |
 | 9 | [#13](https://github.com/DerekHertz/agent-runtime/issues/13) **M2 run** (Derek starts it) | Goal check 2 | not started |
 

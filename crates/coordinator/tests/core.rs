@@ -11,6 +11,7 @@ use trace_store::{Event, EventKind};
 fn state(slots: &[&str]) -> State {
     State::new(&RunConfig {
         slots: slots.iter().map(|s| s.to_string()).collect(),
+        leases: false,
     })
     .unwrap()
 }
@@ -167,6 +168,7 @@ fn step_is_deterministic() {
 fn run_config_rejects_bad_slot_lists() {
     let cfg = |slots: &[&str]| RunConfig {
         slots: slots.iter().map(|s| s.to_string()).collect(),
+        leases: false,
     };
     assert_eq!(State::new(&cfg(&[])).unwrap_err(), ConfigError::NoSlots);
     assert_eq!(

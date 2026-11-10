@@ -31,6 +31,7 @@ use trace_store::{read_events, read_payload, BlobHash, Event, TraceWriter, BLOBS
 fn service(dir: &Path, slots: &[&str]) -> CoordinatorService {
     let config = RunConfig {
         slots: slots.iter().map(|s| s.to_string()).collect(),
+        leases: false,
     };
     CoordinatorService::new(&config, TraceWriter::create(dir).unwrap()).unwrap()
 }

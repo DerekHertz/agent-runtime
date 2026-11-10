@@ -25,6 +25,7 @@ use trace_store::{
 fn service(dir: &Path) -> CoordinatorService {
     let config = RunConfig {
         slots: vec!["slot-1".into(), "slot-2".into()],
+        leases: false,
     };
     CoordinatorService::new(&config, TraceWriter::create(dir).unwrap()).unwrap()
 }

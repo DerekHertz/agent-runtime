@@ -30,6 +30,7 @@ const END_FIELDS: &str = r#"{"reason":"prompt_input_exit"}"#;
 fn service(dir: &Path) -> CoordinatorService {
     let config = RunConfig {
         slots: vec!["slot-1".into(), "slot-2".into()],
+        leases: false,
     };
     CoordinatorService::new(&config, TraceWriter::create(dir).unwrap()).unwrap()
 }
