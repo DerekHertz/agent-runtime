@@ -15,7 +15,7 @@ fn edit(event_id: u64, slot: &str, clock: &[u64], path: &str) -> Event {
         wall_time: 0,
     };
     let input = format!(r#"{{"file_path":"{path}"}}"#);
-    Event::before_tool(stamp, "Edit".into(), format!("t{event_id}"), input)
+    Event::before_tool(stamp, "Edit".into(), format!("t{event_id}"), input, None)
 }
 
 fn art(run_dir: &Path, args: &[&str]) -> (i32, String, String) {

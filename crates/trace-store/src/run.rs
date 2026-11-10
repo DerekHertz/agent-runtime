@@ -10,14 +10,7 @@ use std::path::Path;
 
 use clock::{Clock, Order};
 
-use crate::{read_events, read_payload, Body, Event, Outcome, ShapeError, TRACE_FILE};
-
-/// The tools whose call writes one file, with the input field that names the file.
-const WRITE_TOOLS: [(&str, &str); 3] = [
-    ("Edit", "file_path"),
-    ("Write", "file_path"),
-    ("NotebookEdit", "notebook_path"),
-];
+use crate::{read_events, read_payload, Access, Body, Event, Outcome, ShapeError, TRACE_FILE};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
@@ -73,7 +66,7 @@ impl Run {
         let rows = read_events(&run_dir.join(TRACE_FILE))?;
         let mut inputs = HashMap::new();
         for row in &rows {
-            if write_field(row)?.is_some() {
+            if needs_input(row)? {
                 if let Some(bytes) = read_payload(run_dir, row)? {
                     inputs.insert(row.event_id, bytes);
                 }
@@ -83,7 +76,8 @@ impl Run {
     }
 
     /// Build a run from rows already in memory. `input_of` returns the raw tool input of a
-    /// write call's BeforeTool, and is asked only for those.
+    /// BeforeTool, and is asked only for a write tool's row that has no recorded path (a trace
+    /// written before the coordinator classified calls).
     pub fn from_events(
         rows: Vec<Event>,
         mut input_of: impl FnMut(&Event) -> Option<Vec<u8>>,
@@ -95,9 +89,16 @@ impl Run {
                 event_id: event.event_id,
                 source,
             })?;
-            let write_path = match write_field(&event)? {
-                Some(field) if !failed.contains(&event.event_id) => {
-                    input_of(&event).and_then(|input| path_in(&input, field))
+            let write_path = match event.body()? {
+                Body::BeforeTool { tool, path, .. }
+                    if Access::is_write_tool(tool) && !failed.contains(&event.event_id) =>
+                {
+                    match path {
+                        Some(path) => Some(path.to_owned()),
+                        None => input_of(&event).and_then(|input| {
+                            Access::classify(tool, &input).path().map(str::to_owned)
+                        }),
+                    }
                 }
                 _ => None,
             };
@@ -202,15 +203,13 @@ fn concurrent(a: &RunEvent, b: &RunEvent) -> bool {
     matches!(a.clock.compare(&b.clock), Order::Concurrent | Order::Equal)
 }
 
-/// The input field naming the file, when `event` is the BeforeTool of a write tool.
-fn write_field(event: &Event) -> Result<Option<&'static str>, ShapeError> {
-    Ok(match event.body()? {
-        Body::BeforeTool { tool, .. } => WRITE_TOOLS
-            .iter()
-            .find(|(name, _)| *name == tool)
-            .map(|(_, field)| *field),
-        _ => None,
-    })
+/// Whether `event` is a write tool's BeforeTool with no recorded path, whose stored input must
+/// be read to find the file.
+fn needs_input(event: &Event) -> Result<bool, ShapeError> {
+    Ok(matches!(
+        event.body()?,
+        Body::BeforeTool { tool, path: None, .. } if Access::is_write_tool(tool)
+    ))
 }
 
 /// The BeforeTool ids of the calls whose completion (their first AfterTool) is a failure.
@@ -231,9 +230,4 @@ fn failed_calls(rows: &[Event]) -> Result<HashSet<u64>, ShapeError> {
         .filter(|(_, outcome)| matches!(outcome, Outcome::Failure { .. }))
         .map(|(before, _)| before)
         .collect())
-}
-
-fn path_in(input: &[u8], field: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_slice(input).ok()?;
-    Some(value.get(field)?.as_str()?.to_owned())
 }

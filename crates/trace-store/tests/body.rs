@@ -23,7 +23,7 @@ fn constructed_rows_read_back_as_their_kind() {
         is_interrupt: Some(true),
     };
     let rows = [
-        Event::before_tool(stamp(1), "Edit".into(), "t1".into(), "{}".into()),
+        Event::before_tool(stamp(1), "Edit".into(), "t1".into(), "{}".into(), None),
         Event::after_tool(
             stamp(2),
             "Edit".into(),
@@ -55,7 +55,8 @@ fn constructed_rows_read_back_as_their_kind() {
         [
             Body::BeforeTool {
                 tool: "Edit",
-                tool_use_id: Some("t1")
+                tool_use_id: Some("t1"),
+                path: None
             },
             Body::AfterTool {
                 tool: "Edit",
@@ -77,7 +78,7 @@ fn constructed_rows_read_back_as_their_kind() {
 
 #[test]
 fn a_row_whose_columns_do_not_fit_its_kind_is_refused_by_column() {
-    let before = || Event::before_tool(stamp(1), "Edit".into(), "t1".into(), "{}".into());
+    let before = || Event::before_tool(stamp(1), "Edit".into(), "t1".into(), "{}".into(), None);
     let column = |e: Event| match e.body() {
         Err(ShapeError::Missing { column, .. }) => format!("missing {column}"),
         Err(ShapeError::Foreign { column, .. }) => format!("foreign {column}"),
