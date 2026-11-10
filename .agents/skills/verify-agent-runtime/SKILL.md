@@ -5,7 +5,7 @@ description: Drive the real agent-runtime binaries (art-coordinator, a Unix-sock
 
 # Verify agent-runtime
 
-Surface: two CLI binaries. Claude Code runs `art-shim` once per hook event with the event JSON on stdin and the env vars `AGENT_RUNTIME_SLOT` and `AGENT_RUNTIME_SOCKET`. For PreToolUse (no arguments, or `--hook-event PreToolUse`) the shim asks `art-coordinator` over a Unix socket and prints a hook decision; for PostToolUse (`--hook-event PostToolUse`) it reports the completed call, and for PostToolUseFailure (`--hook-event PostToolUseFailure`) the failed or interrupted one, and prints nothing; `--hook-event Stop` and `--hook-event SessionEnd` report those hooks the same silent way. The coordinator records a stamped event per admitted call and per recorded report in `<runs-dir>/<run-id>/trace.db` (SQLite). There is no UI and no persistent server: each drive starts its own coordinator.
+Surface: three CLI binaries. `art` starts a run (`art run`) and queries a finished one (`art query`); the `launcher` journey drives it. The other two are the hook path. Claude Code runs `art-shim` once per hook event with the event JSON on stdin and the env vars `AGENT_RUNTIME_SLOT` and `AGENT_RUNTIME_SOCKET`. For PreToolUse (no arguments, or `--hook-event PreToolUse`) the shim asks `art-coordinator` over a Unix socket and prints a hook decision; for PostToolUse (`--hook-event PostToolUse`) it reports the completed call, and for PostToolUseFailure (`--hook-event PostToolUseFailure`) the failed or interrupted one, and prints nothing; `--hook-event Stop` and `--hook-event SessionEnd` report those hooks the same silent way. The coordinator records a stamped event per admitted call and per recorded report in `<runs-dir>/<run-id>/trace.db` (SQLite). There is no UI and no persistent server: each drive starts its own coordinator.
 
 Everything is scripted by `scripts/verify.py` (python3 stdlib, no pip). Run it from anywhere; it finds the repo from its own path. Terms follow `GLOSSARY.md`: slot, run, coordinator, shim, clock.
 
@@ -103,4 +103,5 @@ Each drive uses its own run id dir and socket, so concurrent harness runs on dif
 - `scripts/after_tool.py`: the `after-tool` journey, kept apart to hold each file under the line cap. It takes verify.py's helpers as an argument and imports nothing from it; verify.py imports it without writing `__pycache__`.
 - `scripts/failed_tool.py`: the `failed-tool` journey (PostToolUseFailure), kept apart the same way.
 - `scripts/lifecycle.py`: the `lifecycle` journey (Stop and SessionEnd), kept apart the same way.
+- `scripts/launcher.py`: the `launcher` journey (`art run` and `art query`), kept apart the same way. `scripts/fake_agent.py` is the stand-in agent it starts in place of `claude`.
 - `features/`: the maintained feature map. Add a feature file and a `FEATURES` entry in `verify.py` together.
