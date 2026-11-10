@@ -2,7 +2,7 @@
 
 Issue #3 extends tracing from PreToolUse alone (issue #2, PR #14) to every hook event the runtime receives. Its parts are: BeforeTool for the five file and shell tools, AfterTool for success and failure, Stop and SessionEnd, session identity across restarts, pairing of overlapping calls by `tool_use_id`, and tool inputs and outputs kept in content-addressed blake3 blobs (SPEC section 5, "Layout").
 
-The work ships as six focused PRs. Successful and failed completion reports are separate reviews; this changes the delivery breakdown, not the issue scope. Each one leaves the system usable and tested at its own level. A PR targets the PR it actually depends on; work that depends on nothing pending targets `main`. Issue #3 is complete only after PR 6's acceptance checks pass.
+The work ships as six runtime PRs followed by a separate live-smoke tooling PR. Successful and failed completion reports are separate reviews; this changes the delivery breakdown, not the issue scope. Each one leaves the system usable and tested at its own level. A PR targets the PR it actually depends on; work that depends on nothing pending targets `main`. The runtime scope of issue #3 is implemented only after PR 6's acceptance checks pass. PR 7 records the matched live smoke run; all reports are reviewed before any merge.
 
 ## Merge hold
 
@@ -16,6 +16,7 @@ No issue #3 PR merges, and the issue stays open, until Derek has reviewed every 
 4. **Successful AfterTool reports.** PostToolUse becomes a paired AfterTool with its exact input and output in blobs. Includes nonblocking report error handling. Base: PR 3. As built, the `AfterTool` RPC carries a `oneof result` with only `success`; the shim's `--hook-event` argument fixes the error policy (gate exit 2, report exit 1) before configuration, stdin or a panic; `core::completion` pairs by `(session_id, tool_use_id)` through `Identities::record_after`, which keeps the first completion and records orphans with no BeforeTool; the AfterTool row's `payload_hash` names the raw response and `input_payload_hash` the raw input, both stored before the INSERT. Branch `codex/issue-3-after-tool`. Report: [`docs/reviews/issue-3-after-tool.md`](../reviews/issue-3-after-tool.md).
 5. **Failed and interrupted AfterTool reports.** PostToolUseFailure becomes a failed AfterTool without losing its error or interruption metadata. Base: PR 4.
 6. **Stop and SessionEnd, then the full acceptance run.** Base: PR 5.
+7. **Matched live-smoke tooling and report.** Base: PR 6, whose complete hook API it drives. Keeps process supervision, provenance, and the control-versus-tracing experiment separate from runtime review.
 
 ## Integration choices for PRs 2 to 6
 

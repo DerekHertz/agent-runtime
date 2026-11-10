@@ -2,10 +2,25 @@
 
 **Status: draft. HUMAN FEEDBACK PENDING.** Derek has not reviewed this PR. Nothing below is his feedback. When he comments, record it in `docs/reviews/pr-<number>.md` once the PR number exists, and keep this draft as the walkthrough presented.
 
-- **Branch:** `codex/issue-3-after-tool`, PR 4 of the [issue #3 plan](../plans/issue-3.md). Uncommitted working tree; the chief commits and publishes.
+- **Branch:** `codex/issue-3-after-tool`, PR 4 of the [issue #3 plan](../plans/issue-3.md). Implementation commit `f95daae011846db05a00a233da53798e53823eb9`; later report-only commits keep the same verified runtime sources.
 - **Parent and base:** `717ab08013150b8d06e656f475edf92cf22540fe` on `codex/issue-3-call-identity` (PR 3, [its walkthrough](issue-3-call-identity.md)). It stacks on PR 3 because it extends PR 3's `Identities`, schema and reader.
-- **Scope:** successful PostToolUse only. Failed and interrupted reports (PostToolUseFailure) are PR 5; Stop, SessionEnd and the acceptance run are PR 6. The six-PR breakdown is unchanged.
+- **Scope:** successful PostToolUse only. Failed and interrupted reports (PostToolUseFailure) are PR 5; Stop, SessionEnd and the acceptance run are PR 6. Six runtime slices are followed by a separate live-smoke tooling PR so experiment tooling has its own review.
 - **Merge hold:** unmerged until Derek has reviewed all issue #3 reports together. The issue stays open.
+
+## Independent chief verification (2026-11-09 Pacific / 2026-11-10 UTC)
+
+**PASS at implementation `f95daae011846db05a00a233da53798e53823eb9`.** The 30-file runtime source manifest hashes to `5dfb33739572cf6cab06cd569c8bfaf117f7b2950d4406ece971bb58aba5c7d2`. Every file in it matches the committed Git object. The complete task diff stayed unchanged throughout the checks. Hosted results are tracked on this PR's Checks page.
+
+| Check | Verified result |
+| --- | --- |
+| Workspace tests, including real Unix sockets | **166 passed**, after cleaning only workspace build artifacts. Formatting, Clippy with warnings denied, the 1,000-line cap and whitespace checks pass. |
+| `verify.py build`, `doctor`, `drive all`, `cleanup` | **9 real-binary journeys, 108 checks passed.** End-of-run source, receipt and binary checks pass. These are scripted hook fixtures, not live coding. |
+| `formal/admission/check.sh` | **1,883,120 distinct states**, all eight witnesses reached and all 15 deliberately broken variants caught; source sync and real persistence tests pass. Two active RPCs plus an optional seeded BeforeTool remain the model's bounds. |
+| `freshness_proof.py` | All three scenarios prove the expected result: baseline PASS/0; source and binary drift FAIL/1 even with the real journey's 12 checks passing. Originals remain unchanged. |
+| Genuine issue #2 trace compatibility | The current reader returns the exact old input with absent new metadata. The database and recursive run-directory inventory stay identical; no blobs directory is created. |
+| Independent reviews | Native product and verification rechecks, plus a separate Codex CLI review, have no remaining findings. The CLI review's socket restriction is covered by the chief's host run above. |
+
+Reproduce with the [verification skill](../../.agents/skills/verify-agent-runtime/SKILL.md) and [formal skill](../../.agents/skills/formal-verify-admission/SKILL.md). Local raw evidence: `.claude/reviews/issue3-pr4-verified/` (commands, logs, source/Git provenance), `issue3-pr4-legacy/`, and `issue3-pr4-codex-review.txt`. Raw evidence is gitignored. Earlier author runs and review repairs below are historical; this section is the final independent local verdict.
 
 ## What it does
 
