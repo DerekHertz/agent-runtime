@@ -77,7 +77,7 @@ fn event_carries_slot_session_tool_kind_and_now() {
     assert_eq!(e.slot, "slot-1");
     assert_eq!(e.session_id, "session-of-slot-1");
     assert_eq!(e.tool.as_deref(), Some("Write"));
-    assert_eq!(e.path, None);
+    assert_eq!(events[0].path.as_deref(), Some("/work/src/lib.rs"));
     assert_eq!(e.payload_hash, None);
     // The raw tool input is recorded byte for byte (SPEC section 7: re-classify offline).
     assert_eq!(
@@ -177,4 +177,19 @@ fn run_config_rejects_bad_slot_lists() {
         State::new(&cfg(&["a", "b", "a"])).unwrap_err(),
         ConfigError::DuplicateSlot("a".into())
     );
+}
+
+#[test]
+fn a_before_tool_records_the_file_its_tool_names_and_none_for_bash() {
+    let st = state(&["slot-1"]);
+    let mut paths = Vec::new();
+    let mut st = st;
+    for tool in ["Edit", "Write", "Read", "Bash"] {
+        let (next, events, admission) = run(st, before("slot-1", tool), 0);
+        assert_eq!(admission.verdict, Verdict::Allow);
+        paths.push(events[0].path.clone());
+        st = next;
+    }
+    let file = Some("/work/src/lib.rs".to_string());
+    assert_eq!(paths, [file.clone(), file.clone(), file, None]);
 }

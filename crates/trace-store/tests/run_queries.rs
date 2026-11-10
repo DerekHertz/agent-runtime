@@ -24,6 +24,7 @@ fn edit(event_id: u64, slot: &str, clock: &[u64], path: &str) -> Event {
         "Edit".into(),
         format!("t{event_id}"),
         input,
+        None,
     )
 }
 
@@ -193,4 +194,43 @@ fn fifty_thousand_events_are_queried_in_well_under_a_second() {
     };
     println!("50,000 events: concurrent_writes and causal_past took {elapsed:?}");
     assert!(elapsed.as_millis() < bound_ms, "queries took {elapsed:?}");
+}
+
+#[test]
+fn a_recorded_path_is_used_as_is_and_the_stored_input_is_not_asked_for() {
+    let write = |id: u64, slot: &str, clock: &[u64], path: Option<&str>| {
+        Event::before_tool(
+            stamp(id, slot, clock),
+            "Write".into(),
+            format!("t{id}"),
+            "{}".into(),
+            path.map(str::to_owned),
+        )
+    };
+    let read = Event::before_tool(
+        stamp(3, "slot-2", &[0, 2]),
+        "Read".into(),
+        "t3".into(),
+        "{}".into(),
+        Some("/w/a.rs".into()),
+    );
+    let rows = vec![
+        write(1, "slot-1", &[1, 0], Some("/w/a.rs")),
+        write(2, "slot-2", &[0, 1], Some("/w/a.rs")),
+        read,
+        write(4, "slot-1", &[2, 0], None),
+    ];
+    let mut asked = Vec::new();
+    let run = Run::from_events(rows, |e| {
+        asked.push(e.event_id);
+        None
+    })
+    .unwrap();
+    // Only the write with no recorded path needed its input, and a Read is never a write.
+    assert_eq!(asked, [4]);
+    assert_eq!(
+        run.writes().map(|e| e.event.event_id).collect::<Vec<_>>(),
+        [1, 2]
+    );
+    assert_eq!(run.concurrent_writes().len(), 1);
 }

@@ -32,10 +32,12 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OpenFlags};
 
+mod access;
 mod blobs;
 mod body;
 mod durable_dir;
 mod run;
+pub use access::Access;
 pub use blobs::{read_blob, BlobError, BlobHash, BlobStore, BLOBS_DIR};
 pub use body::{Body, ShapeError, Stamp};
 pub use run::{ConcurrentWrites, Run, RunError, RunEvent};

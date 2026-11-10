@@ -28,6 +28,9 @@ pub enum Body<'a> {
     BeforeTool {
         tool: &'a str,
         tool_use_id: Option<&'a str>,
+        /// The file the call names. `None` for a tool that names none, and for every row written
+        /// before the coordinator classified calls.
+        path: Option<&'a str>,
     },
     /// A completed tool call. `before_event_id` is `None` for an orphan completion.
     AfterTool {
@@ -80,16 +83,19 @@ impl Event {
         }
     }
 
-    /// A BeforeTool to append. Its payload is the raw hook `tool_input`.
+    /// A BeforeTool to append. Its payload is the raw hook `tool_input`, and `path` is the file
+    /// the call reads or writes when its tool names one ([`crate::Access`]).
     pub fn before_tool(
         stamp: Stamp,
         tool: String,
         tool_use_id: String,
         tool_input: String,
+        path: Option<String>,
     ) -> Event {
         Event {
             tool: Some(tool),
             tool_use_id: Some(tool_use_id),
+            path,
             ..Event::blank(stamp, EventKind::BeforeTool, tool_input)
         }
     }
@@ -153,6 +159,7 @@ impl Event {
                 Ok(Body::BeforeTool {
                     tool: self.tool.as_deref().ok_or(missing("tool"))?,
                     tool_use_id: self.tool_use_id.as_deref(),
+                    path: self.path.as_deref(),
                 })
             }
             EventKind::AfterTool => Ok(Body::AfterTool {

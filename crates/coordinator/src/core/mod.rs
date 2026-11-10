@@ -233,7 +233,16 @@ fn before_tool(mut state: State, call: BeforeTool, now: i64) -> (State, Vec<Outp
         vclock: stamp.to_bytes(),
         wall_time: now,
     };
-    let event = Event::before_tool(stamp, call.tool, call.tool_use_id, call.tool_input_json);
+    let path = classification::classify(&call.tool, &call.tool_input_json)
+        .path()
+        .map(str::to_owned);
+    let event = Event::before_tool(
+        stamp,
+        call.tool,
+        call.tool_use_id,
+        call.tool_input_json,
+        path,
+    );
     state.next_event_id += 1;
     (
         state,
