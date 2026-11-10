@@ -75,7 +75,7 @@ fn a_bad_question_or_run_exits_2_with_usage() {
         let (code, stdout, stderr) = art(tmp.path(), args);
         assert_eq!((code, stdout.as_str()), (2, ""), "{args:?}");
         assert!(
-            stderr.starts_with("art: ") && stderr.contains("usage: art query"),
+            stderr.starts_with("art: ") && stderr.contains("art query <run-dir>"),
             "{stderr}"
         );
     }

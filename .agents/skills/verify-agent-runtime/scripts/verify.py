@@ -17,6 +17,7 @@ sys.dont_write_bytecode = True  # importing the journey module must leave no __p
 import after_tool  # noqa: E402  the after-tool journey, in its own file (scripts/after_tool.py)
 import failed_tool  # noqa: E402  the failed-tool journey (scripts/failed_tool.py)
 import lifecycle  # noqa: E402  the lifecycle journey, Stop and SessionEnd (scripts/lifecycle.py)
+import launcher  # noqa: E402  the launcher journey, art run and art query (scripts/launcher.py)
 
 SCRIPT = pathlib.Path(__file__).resolve()
 SKILL = SCRIPT.parents[1]
@@ -55,7 +56,7 @@ def target_dir(args):
 
 def binaries(args):
     d = target_dir(args) / "debug"
-    return {"art-coordinator": d / "art-coordinator", "art-shim": d / "art-shim"}
+    return {"art-coordinator": d / "art-coordinator", "art-shim": d / "art-shim", "art": d / "art"}
 
 
 def clean_env(**extra):
@@ -739,6 +740,7 @@ FEATURES = {
     "after-tool": lambda c: after_tool.journey(c, sys.modules[__name__]),
     "failed-tool": lambda c: failed_tool.journey(c, sys.modules[__name__]),
     "lifecycle": lambda c: lifecycle.journey(c, sys.modules[__name__]),
+    "launcher": lambda c: launcher.journey(c, sys.modules[__name__]),
 }
 
 
