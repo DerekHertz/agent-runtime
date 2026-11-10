@@ -6,8 +6,10 @@
 
 pub mod classification;
 pub mod clocks;
+pub mod coherence;
 pub mod completion;
 pub mod defer;
+pub mod files;
 pub mod identity;
 pub mod leases;
 pub mod lifecycle;
@@ -17,11 +19,10 @@ use std::collections::HashSet;
 
 use trace_store::{Event, Stamp};
 
-use classification::Access;
 use clocks::Clocks;
+use coherence::Coherence;
 pub use completion::{AfterTool, ToolResult};
 use identity::{Call, CallKey, Identities, Session};
-use leases::Leases;
 pub use lifecycle::{Lifecycle, LifecycleKind};
 
 /// The fixed set of slots a run is started with.
@@ -65,8 +66,8 @@ impl RunConfig {
 pub struct State {
     clocks: Clocks,
     identities: Identities,
-    /// `None` when the run takes no leases: every call is then allowed.
-    leases: Option<Leases>,
+    /// `None` when the run takes no leases: every call is then allowed and no clock merges.
+    coherence: Option<Coherence>,
     next_event_id: u64,
 }
 
@@ -77,7 +78,7 @@ impl State {
         Ok(Self {
             clocks: Clocks::new(&config.slots),
             identities: Identities::default(),
-            leases: config.leases.then(Leases::default),
+            coherence: config.leases.then(Coherence::default),
             next_event_id: 1,
         })
     }
@@ -103,8 +104,14 @@ impl State {
 
     /// The slot holding the lease on `path`, if any.
     pub fn lease_holder(&self, path: &str) -> Option<&str> {
-        let lease = self.leases.as_ref()?.on(path)?;
-        Some(lease.holder.as_str())
+        self.coherence.as_ref()?.lease_holder(path)
+    }
+
+    /// Whether `slot` must re-read `path` before it may write it.
+    pub fn must_reread(&self, path: &str, slot: &str) -> bool {
+        self.coherence
+            .as_ref()
+            .is_some_and(|c| c.is_stale_for(path, slot))
     }
 
     /// A recorded call, by its `(session_id, tool_use_id)`.
@@ -208,9 +215,9 @@ impl Admission {
 /// A refused input (unknown slot, empty tool, empty or rebound session, empty or repeated
 /// `tool_use_id`, an AfterTool naming another tool than its call, a lifecycle report without its
 /// fields) gets a Deny or a refused Ack, no `Record`, and the state back unchanged. A write
-/// denied for a lease is not a refused input: it is recorded as a `Deny` event, ticks its slot
-/// and is answered with a Deny that names the holder. A Stop or SessionEnd releases every lease
-/// its slot holds. The adapter
+/// denied by the coherence rules is not a refused input: it is recorded as a `Deny` event, ticks
+/// its slot and is answered with a Deny (see [`coherence`]). A Stop or SessionEnd releases every
+/// lease its slot holds. The adapter
 /// commits the returned state only after the `Record` is appended, so a failed append binds no
 /// session, uses no call identity and completes no call. A Stop or SessionEnd changes no call,
 /// completion or binding other than binding its own session on its first event.
@@ -246,18 +253,11 @@ fn before_tool(mut state: State, call: BeforeTool, now: i64) -> (State, Vec<Outp
         );
     }
     let access = classification::classify(&call.tool, &call.tool_input_json);
-    // A write needs the file's lease. The claim is made on the copy of the state, so a failed
-    // append leaves the table as it was.
-    let denied = match (&mut state.leases, &access) {
-        (Some(leases), Access::Write { path }) => leases
-            .claim(path, &call.slot, &call.intent, now)
-            .err()
-            .map(|lease| {
-                let reason = leases::deny_reason(path, lease, now);
-                (path.clone(), reason, lease.holder.clone())
-            }),
-        _ => None,
-    };
+    // The coherence rules run on the copy of the state, before the event is stamped, so what a
+    // Read or a Deny teaches the slot is in the stamp, and a failed append leaves it all undone.
+    let denied = state.coherence.as_mut().and_then(|coherence| {
+        coherence.admit(&mut state.clocks, &call.slot, &access, &call.intent, now)
+    });
     let event_id = state.next_event_id;
     let recorded = match &denied {
         Some(_) => state
@@ -268,8 +268,8 @@ fn before_tool(mut state: State, call: BeforeTool, now: i64) -> (State, Vec<Outp
             .record_before(&call.slot, key, event_id, &call.tool),
     };
     recorded.expect("the call is new: checked above");
-    // Clock rule 1 only. Nothing merges here: ADR 0002, clocks cross only through knowledge
-    // channels. A new session of a slot continues that slot's clock.
+    // Clock rule 1. Rule 2 (merging) happens only in `coherence`: ADR 0002, clocks cross only
+    // through knowledge channels. A new session of a slot continues that slot's clock.
     let stamp = state
         .clocks
         .tick(&call.slot)
@@ -283,16 +283,16 @@ fn before_tool(mut state: State, call: BeforeTool, now: i64) -> (State, Vec<Outp
     };
     state.next_event_id += 1;
     let (event, admission) = match denied {
-        Some((path, reason, owner)) => (
+        Some(denied) => (
             Event::deny(
                 stamp,
                 call.tool,
                 call.tool_use_id,
-                path,
+                denied.path,
                 call.tool_input_json,
-                &reason,
+                &denied.reason,
             ),
-            Admission::deny_for_lease(reason, owner),
+            Admission::deny_for_lease(denied.reason, denied.owner.unwrap_or_default()),
         ),
         None => (
             Event::before_tool(

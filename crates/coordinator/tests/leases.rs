@@ -1,6 +1,7 @@
 //! Single-writer leases in the pure core (SPEC section 4): a slot's first admitted write to a
 //! file takes its lease, another slot's write to that file is denied and recorded as a Deny
-//! event, and the holder's Stop or SessionEnd releases it. With leases off every call is allowed.
+//! event, and the holder's Stop or SessionEnd releases it, after which every other slot must read
+//! the file again before writing it. With leases off every call is allowed.
 
 use clock::Clock;
 use coordinator::core::identity::{CallKey, CallState, SessionPhase};
@@ -108,8 +109,9 @@ fn the_second_slot_to_write_a_file_is_denied_and_the_deny_is_an_event() {
         deny.input_payload.as_deref(),
         Some(r#"{"file_path":"/work/src/lib.rs"}"#)
     );
-    // A Deny is an event of its slot: it ticks that slot's clock and merges nothing.
-    assert_eq!((deny.event_id, stamp(&deny)), (2, vec![0, 1]));
+    // A Deny is an event of its slot. It ticks that slot's clock, and the slot absorbs the
+    // holder's clock from when it took the lease (the Deny knowledge channel).
+    assert_eq!((deny.event_id, stamp(&deny)), (2, vec![1, 1]));
     assert_eq!(st.lease_holder(FILE), Some("slot-1"));
     let key = CallKey {
         session_id: "sess-slot-2".into(),
@@ -163,7 +165,17 @@ fn stop_and_session_end_each_release_every_lease_of_their_slot() {
         assert_eq!(st.lease_holder(FILE), None);
         assert_eq!(st.lease_holder("/work/src/new.rs"), None);
 
-        let (st, _, admitted) = run(st, edit("slot-2", "b2"), 0);
+        // The file changed under slot-2, so it must read it again before it may write it.
+        let (st, event, stale) = run(st, edit("slot-2", "b2"), 0);
+        let stale = stale.unwrap();
+        assert_eq!((stale.verdict, stale.owner.as_str()), (Verdict::Deny, ""));
+        assert!(stale.reason.contains("Re-read first"), "{}", stale.reason);
+        assert_eq!(event.unwrap().kind, EventKind::Deny);
+        assert_eq!(st.lease_holder(FILE), None);
+        assert!(st.must_reread(FILE, "slot-2"));
+        let (st, ..) = run(st, call("slot-2", "Read", "b3", FILE, ""), 0);
+        assert!(!st.must_reread(FILE, "slot-2"));
+        let (st, _, admitted) = run(st, edit("slot-2", "b4"), 0);
         assert_eq!(admitted.unwrap().verdict, Verdict::Allow);
         assert_eq!(st.lease_holder(FILE), Some("slot-2"));
         // The released slot is now the one that is denied.

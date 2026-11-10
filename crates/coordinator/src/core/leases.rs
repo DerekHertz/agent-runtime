@@ -2,13 +2,15 @@
 //!
 //! A lease is taken by a slot's first admitted write to a file and held until that slot's
 //! session stops or ends. While it is held, a write to the file from any other slot is denied.
-//! The table knows nothing about tools, clocks or sessions: the caller says which slot wants
-//! which file, and which slot is letting go.
+//! The table knows nothing about tools or sessions, and it only stores the clock it is handed:
+//! the caller says which slot wants which file, and which slot is letting go.
 //!
-//! Not here yet: the time limit, release commands, Defer, whole-tree leases for Bash, and the
-//! Invalid standing that makes a slot re-read a file changed under it.
+//! Not here: the time limit, release commands, Defer and whole-tree leases for Bash. The rule
+//! that a slot must re-read a file changed under it is in [`super::files`].
 
 use std::collections::BTreeMap;
+
+use clock::Clock;
 
 /// One slot's exclusive right to write one file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +20,8 @@ pub struct Lease {
     pub intent: String,
     /// Wall time the lease was taken, milliseconds since the Unix epoch. For the Deny reason only.
     pub taken_at: i64,
+    /// The holder's clock when it took the lease, which a slot denied for it absorbs (ADR 0002).
+    pub taken_clock: Clock,
 }
 
 /// The run's leases, by file.
@@ -30,11 +34,19 @@ impl Leases {
     /// `slot` wants to write `path`. Granted when the file is free or already its own, in which
     /// case the first lease stays as taken. Refused with the other slot's lease otherwise; the
     /// table is then unchanged.
-    pub fn claim(&mut self, path: &str, slot: &str, intent: &str, now: i64) -> Result<(), &Lease> {
+    pub fn claim(
+        &mut self,
+        path: &str,
+        slot: &str,
+        intent: &str,
+        now: i64,
+        clock: &Clock,
+    ) -> Result<(), &Lease> {
         let lease = self.held.entry(path.to_owned()).or_insert_with(|| Lease {
             holder: slot.to_owned(),
             intent: intent.to_owned(),
             taken_at: now,
+            taken_clock: clock.clone(),
         });
         if lease.holder == slot {
             Ok(())
@@ -88,22 +100,25 @@ mod tests {
     #[test]
     fn a_file_has_one_holder_until_that_slot_releases() {
         let mut leases = Leases::default();
-        assert!(leases.claim("a.rs", "slot-1", "fix mean", 1_000).is_ok());
-        assert!(leases.claim("a.rs", "slot-1", "again", 9_000).is_ok());
+        let c = Clock::new(2);
+        assert!(leases
+            .claim("a.rs", "slot-1", "fix mean", 1_000, &c)
+            .is_ok());
+        assert!(leases.claim("a.rs", "slot-1", "again", 9_000, &c).is_ok());
         assert_eq!(leases.on("a.rs").unwrap().taken_at, 1_000);
         let held = leases
-            .claim("a.rs", "slot-2", "", 2_000)
+            .claim("a.rs", "slot-2", "", 2_000, &c)
             .unwrap_err()
             .clone();
         assert_eq!(
             (held.holder.as_str(), held.intent.as_str()),
             ("slot-1", "fix mean")
         );
-        assert!(leases.claim("b.rs", "slot-2", "", 2_000).is_ok());
-        assert!(leases.claim("c.rs", "slot-1", "", 2_000).is_ok());
+        assert!(leases.claim("b.rs", "slot-2", "", 2_000, &c).is_ok());
+        assert!(leases.claim("c.rs", "slot-1", "", 2_000, &c).is_ok());
 
         assert_eq!(leases.release_all("slot-1"), ["a.rs", "c.rs"]);
-        assert!(leases.claim("a.rs", "slot-2", "", 3_000).is_ok());
+        assert!(leases.claim("a.rs", "slot-2", "", 3_000, &c).is_ok());
         assert_eq!(leases.on("b.rs").unwrap().holder, "slot-2");
         assert!(leases.release_all("slot-1").is_empty());
     }
@@ -114,6 +129,7 @@ mod tests {
             holder: "slot-1".into(),
             intent: "fix mean".into(),
             taken_at: 10_000,
+            taken_clock: Clock::new(2),
         };
         let reason = deny_reason("src/lib.rs", &lease, 135_500);
         assert!(reason.starts_with(
