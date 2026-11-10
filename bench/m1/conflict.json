@@ -1,0 +1,15 @@
+{
+  "target": "../toy",
+  "model": "haiku",
+  "allowed_tools": "Read,Edit,Write,Bash(cargo test:*)",
+  "slots": [
+    {
+      "slot": "slot-1",
+      "prompt": "Work in src/lib.rs, one step at a time, and run cargo test after each step. Step 1: the test mean_works fails; fix the bug in fn mean. Step 2: add a unit test mean_of_one that checks mean(&[5]) is Some(5.0). Step 3: add a unit test mean_of_negatives that checks mean(&[-2, 2]) is Some(0.0)."
+    },
+    {
+      "slot": "slot-2",
+      "prompt": "In src/lib.rs, rewrite fn mean so that it computes the sum as f64 before dividing, and update its doc comment to say what it returns for an empty slice. Then run cargo test."
+    }
+  ]
+}

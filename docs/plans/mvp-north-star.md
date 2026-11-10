@@ -13,6 +13,8 @@ Set 2026-11-10 by Derek: finish the M1/M2 proof. The goal is done when the same 
 
 Nothing else is in the goal. Work that does not move a rung below is filed as an issue and deferred.
 
+**Status 2026-11-10: both checks pass on live runs.** Every rung below is climbed. What the result does and does not show is in the [write-up](../research/m1-m2-conflicting-runs.md). The next goal is not set; it waits for the joint walkthrough with Derek.
+
 ### The ladder
 
 Each rung is one small PR that ends in a check someone can run. A rung is climbed only when its check has passed. This table is the only record of where the work stands; update it in the PR that climbs the rung.
@@ -24,11 +26,11 @@ Each rung is one small PR that ends in a check someone can run. A rung is climbe
 | 3 | Model the domain: `Call` as an enum of its three states; `Event` built by per-kind constructors and read through `Event::body` | Workspace tests and `check.sh --code` pass with no behavior change | climbed 2026-11-10 |
 | 4 | [#4](https://github.com/DerekHertz/agent-runtime/issues/4) Causal queries | `art query concurrent-writes` lists a planted pair in a fixture trace | climbed 2026-11-10 |
 | 5 | [#6](https://github.com/DerekHertz/agent-runtime/issues/6) Launcher | `art run` with a two-slot run file puts both sessions' hook events in one trace | climbed 2026-11-10 with a stand-in agent; a live session is rung 6 |
-| 6 | [#7](https://github.com/DerekHertz/agent-runtime/issues/7) **M1 run** (Derek starts it) | Goal check 1 | not started |
+| 6 | [#7](https://github.com/DerekHertz/agent-runtime/issues/7) **M1 run** (Claude ran it at Derek's go-ahead) | Goal check 1 | climbed 2026-11-10: 2 pairs in `m1b` ([write-up](../research/m1-m2-conflicting-runs.md)) |
 | 7 | Classify the file each Edit, Write, NotebookEdit and Read names, in the core, and record it in `path` (the part of [#5](https://github.com/DerekHertz/agent-runtime/issues/5) the leases need) | A recorded BeforeTool carries its file; `Run` uses it | climbed 2026-11-10 |
 | 8 | [#8](https://github.com/DerekHertz/agent-runtime/issues/8) Leases with Deny, with the session as an explicit state machine that releases on Stop and SessionEnd | Two slots write one file: the second is denied and the Deny is in the trace | climbed 2026-11-10 |
 | 8b | Invalidation on release and the two knowledge channels of [#5](https://github.com/DerekHertz/agent-runtime/issues/5): Read absorbs the file's release clock, Deny absorbs the holder's lease clock | A Read after another slot's write and release orders that write before the reader's next event | climbed 2026-11-10 |
-| 9 | [#13](https://github.com/DerekHertz/agent-runtime/issues/13) **M2 run** (Derek starts it) | Goal check 2 | not started |
+| 9 | [#13](https://github.com/DerekHertz/agent-runtime/issues/13) **M2 run** (Claude ran it at Derek's go-ahead) | Goal check 2 | climbed 2026-11-10: 0 pairs and 1 Deny in `m2b` ([write-up](../research/m1-m2-conflicting-runs.md)) |
 
 Rungs 4 and 5 do not depend on each other and can be built in parallel. Rung 3 comes first because rungs 4 and 8 read the two types it fixes.
 

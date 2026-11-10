@@ -2,14 +2,14 @@
 
 This file records runs of real coding work with and without the runtime, so their outcomes can be compared. The rule is in [AGENTS.md](../../AGENTS.md#dogfooding-records). The protocol is below.
 
-**Status (2026-11-09): no matched comparison has been recorded, and no runtime-enabled live coding run has been verified in this project.** M0 is the documented live hook experiment. It ran before the runtime existed.
+**Status (2026-11-10): one pair of runtime-enabled live runs is recorded, tracing against leases, one run each. No runtime-disabled control has been run, so there is still no comparison against working without the runtime.** M0 is the earlier live hook experiment, from before the runtime existed.
 
 ## Terms
 
 - **Condition.**
   - `control`: the same launcher and hooks, with the runtime disabled.
-  - `enabled-tracing`: the coordinator is running, and each session's shim is bound to a slot. The coordinator records tool calls without enforcing leases. This is the current milestone.
-  - `enabled-leases`: as `enabled-tracing`, with lease enforcement. Not available yet; a future milestone.
+  - `enabled-tracing`: the coordinator is running, and each session's shim is bound to a slot. The coordinator records tool calls without enforcing leases.
+  - `enabled-leases`: as `enabled-tracing`, with lease enforcement (`--leases`).
   - `none`: the runtime did not exist or was not installed.
 - **Kind.**
   - `live`: real Claude Code sessions doing the work.
@@ -21,8 +21,9 @@ This file records runs of real coding work with and without the runtime, so thei
 | ID | Condition | Kind | Scenario | Revision | Invocation | Agents and settings | Outcome | Evidence and limitations |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | M0 | none (probe hook only) | live | Hook probe: six single-session experiments on a fresh copy of `bench/toy` | `ef47214` | `python3 -I bench/m0/run_m0.py` | One slot. `claude -p --model haiku` on Claude Code 2.1.318, subscription login, clean environment | Results of six hook experiments | [m0-hook-probe.md](m0-hook-probe.md). Raw logs in `bench/m0/runs/` are gitignored. This is baseline evidence about hook behavior only. It is not a control for any comparison workload. |
-| D1-control | control | live | M1 conflicting run: two agents prompted to edit the same function in `bench/toy` (SPEC section 9) | — | — | — | not run | Proposed first pair |
-| D1-enabled | enabled-tracing | live | Same as D1-control | — | — | — | not run | Proposed first pair |
+| D1-control | control | live | M1 conflicting run: two agents prompted to edit the same function in `bench/toy` (SPEC section 9) | — | — | — | not run | A runtime-disabled control has not been run. D1-tracing is the leases-off condition |
+| D1-tracing | enabled-tracing | live | Same workload, `bench/m1/conflict.json` | `2e88429` | `art run bench/m1/conflict.json --run-id m1b --runs-dir ~/art-runs` | Two slots. `claude -p --model haiku` on Claude Code 2.1.319, subscription login, clean environment | 2 concurrent write pairs on `src/lib.rs`, 0 Denies; both sessions exit 0; final tree passes 5 tests | [Write-up](m1-m2-conflicting-runs.md). One run. Run directory not committed. Tick-only clocks make the pair count an upper bound |
+| D1-leases | enabled-leases | live | Same workload | `2e88429` | The same with `--run-id m2b --leases` | As D1-tracing | 0 concurrent write pairs, 1 Deny ("re-read first"); both sessions exit 0; final tree passes 5 tests | [Write-up](m1-m2-conflicting-runs.md). One run. Differs from D1-tracing in leases and in the Read and Deny channels |
 
 ## Not dogfooding
 
