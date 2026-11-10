@@ -20,8 +20,8 @@ Each rung is one small PR that ends in a check someone can run. A rung is climbe
 | Rung | Work | Check that climbs it | State |
 | --- | --- | --- | --- |
 | 1 | [#3](https://github.com/DerekHertz/agent-runtime/issues/3) PR 6: Stop and SessionEnd | Issue #3's five criteria pass in `e2e_acceptance.rs`; `verify.py drive all`; `formal/admission/check.sh` | climbed 2026-11-10 |
-| 2 | Land the issue #3 stack (PRs #15 to #19 and PR 6) | All six merged to `main`, CI green | not started |
-| 3 | Model the domain: `Event` as one variant per kind, `Call` as an enum of its three states | Workspace tests and `check.sh` pass with no behavior change | not started |
+| 2 | Land the issue #3 stack (PRs #15 to #19 and PR 6) | All six merged to `main`, CI green | climbed 2026-11-10 (merge of #23) |
+| 3 | Model the domain: `Call` as an enum of its three states; `Event` built by per-kind constructors and read through `Event::body` | Workspace tests and `check.sh --code` pass with no behavior change | climbed 2026-11-10 |
 | 4 | [#4](https://github.com/DerekHertz/agent-runtime/issues/4) Causal queries | `art query concurrent-writes` lists a planted pair in a fixture trace | not started |
 | 5 | [#6](https://github.com/DerekHertz/agent-runtime/issues/6) Launcher | `art run` with a two-slot run file puts both sessions' hook events in one trace | not started |
 | 6 | [#7](https://github.com/DerekHertz/agent-runtime/issues/7) **M1 run** (Derek starts it) | Goal check 1 | not started |
@@ -41,9 +41,9 @@ Rungs 4 and 5 do not depend on each other and can be built in parallel. Rung 3 c
 
 ### Per-rung process
 
-One writer (Claude). Per rung: tests first, the two project verification skills where they apply, one `codex review` with at most three repair rounds, then the PR. No seal scripts, receipts or evidence audits beyond what those skills already write. The issue #3 review reports in `docs/reviews/` stay as they are; new rungs get a PR description and a walkthrough, not a report packet.
+One writer (Claude Fable, inline, no swarm). Per rung: tests first, the two project verification skills where they apply, then a small PR that merges on green CI. Derek dropped the per-rung Codex review on 2026-11-10; he and Claude walk through every rung together at the end instead. No seal scripts, receipts or evidence audits beyond what those skills already write. The issue #3 review reports in `docs/reviews/` stay as they are; new rungs get a PR description and a walkthrough, not a report packet.
 
-Derek granted a standing "merge on PASS" for this ladder on 2026-11-10: Claude may commit, push, open and merge a rung's PR once Codex review is clean, CI is green and the rung's check has passed. The grant covers the ladder only, and it replaces the issue #3 merge hold. Derek still starts the two live runs.
+Derek granted a standing "merge on PASS" for this ladder on 2026-11-10: Claude may commit, push, open and merge a rung's PR once CI is green and the rung's check has passed. The grant covers the ladder only, and it replaces the issue #3 merge hold. Derek still starts the two live runs.
 
 The earlier issue #3 breakdown is in the [issue plan](issue-3.md). The live-comparison harness stays [follow-up #20](https://github.com/DerekHertz/agent-runtime/issues/20).
 

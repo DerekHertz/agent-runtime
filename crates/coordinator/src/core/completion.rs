@@ -10,7 +10,7 @@
 //! first report of a call is its completion whatever either outcome is. Every accepted report
 //! ticks its slot's clock and records one event; nothing merges.
 
-use trace_store::{Event, EventKind, Outcome};
+use trace_store::{Event, Outcome, Stamp};
 
 use super::identity::CallKey;
 use super::{Ack, Output, State};
@@ -102,23 +102,22 @@ pub(super) fn after_tool(mut state: State, report: AfterTool, now: i64) -> (Stat
         .clocks
         .tick(&report.slot)
         .expect("the slot is in the run: checked above");
-    let event = Event {
+    let stamp = Stamp {
         event_id,
         slot: report.slot,
         session_id: report.session_id,
         vclock: stamp.to_bytes(),
-        kind: EventKind::AfterTool,
-        tool: Some(report.tool),
-        path: None,
-        payload_hash: None,
-        payload: Some(payload),
-        input_payload_hash: None,
-        input_payload: Some(report.tool_input_json),
-        tool_use_id: Some(report.tool_use_id),
-        before_event_id,
-        outcome: Some(outcome),
         wall_time: now,
     };
+    let event = Event::after_tool(
+        stamp,
+        report.tool,
+        report.tool_use_id,
+        before_event_id,
+        outcome,
+        report.tool_input_json,
+        payload,
+    );
     state.next_event_id += 1;
     (
         state,

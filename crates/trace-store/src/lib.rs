@@ -33,8 +33,10 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OpenFlags};
 
 mod blobs;
+mod body;
 mod durable_dir;
 pub use blobs::{read_blob, BlobError, BlobHash, BlobStore, BLOBS_DIR};
+pub use body::{Body, ShapeError, Stamp};
 
 /// File name of the trace inside a run directory.
 pub const TRACE_FILE: &str = "trace.db";

@@ -6,7 +6,7 @@
 //! and a new session on the same slot continues the slot's clock.
 
 use clock::Clock;
-use coordinator::core::identity::{Call, CallKey};
+use coordinator::core::identity::{Call, CallKey, CallState};
 use coordinator::core::{
     step, Ack, AfterTool, BeforeTool, Input, Lifecycle, LifecycleKind, Output, RunConfig, State,
     ToolResult, Verdict,
@@ -152,23 +152,24 @@ fn a_session_end_keeps_calls_completions_and_the_binding_for_late_reports() {
     assert_eq!(
         st.call(&key("x", "ta")),
         Some(&Call {
-            before_event_id: Some(a.event_id),
             tool: "Edit".into(),
-            completed_event_id: None
+            state: CallState::Open {
+                before_event_id: a.event_id
+            }
         })
     );
     // A late completion after SessionEnd pairs with its BeforeTool, not as an orphan.
     let (st, late) = recorded(st, after("slot-1", "x", "ta"));
     assert_eq!(late.before_event_id, Some(a.event_id));
     assert_eq!(
-        st.call(&key("x", "ta")).unwrap().completed_event_id,
+        st.call(&key("x", "ta")).unwrap().completed_event_id(),
         Some(late.event_id)
     );
     // The completed call's first completion stays; a repeat after SessionEnd pairs the same way.
     let (st, again) = recorded(st, after("slot-1", "x", "tb"));
     assert_eq!(again.before_event_id, Some(b.event_id));
     assert_eq!(
-        st.call(&key("x", "tb")).unwrap().completed_event_id,
+        st.call(&key("x", "tb")).unwrap().completed_event_id(),
         Some(done_b.event_id)
     );
     // A repeated BeforeTool is still refused after SessionEnd: the call is remembered.
@@ -241,7 +242,10 @@ fn refusals_record_nothing_and_change_nothing() {
         let (next, reason) = refused(st.clone(), input, session);
         assert!(reason.contains(why), "{reason}");
         assert_eq!(next.session_slot("new"), None);
-        assert_eq!(next.call(&key("x", "t1")).unwrap().completed_event_id, None);
+        assert_eq!(
+            next.call(&key("x", "t1")).unwrap().completed_event_id(),
+            None
+        );
     }
     // The corrected report is event 2 at slot-1's next stamp.
     let (_, ok) = recorded(st, end("slot-1", "x"));

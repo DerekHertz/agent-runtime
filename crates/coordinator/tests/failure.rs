@@ -5,7 +5,7 @@
 //! first. Every refusal records nothing and changes nothing.
 
 use clock::Clock;
-use coordinator::core::identity::{Call, CallKey};
+use coordinator::core::identity::{Call, CallKey, CallState};
 use coordinator::core::{
     step, Ack, AfterTool, BeforeTool, Input, Output, RunConfig, State, ToolResult, Verdict,
 };
@@ -146,8 +146,14 @@ fn a_failure_pairs_by_identity_and_keeps_its_input_error_and_flag() {
         [stamp(&ba), stamp(&bb), stamp(&fb), stamp(&fa)],
         [vec![1, 0], vec![2, 0], vec![3, 0], vec![4, 0]]
     );
-    assert_eq!(st.call(&key("s", "B")).unwrap().completed_event_id, Some(3));
-    assert_eq!(st.call(&key("s", "A")).unwrap().completed_event_id, Some(4));
+    assert_eq!(
+        st.call(&key("s", "B")).unwrap().completed_event_id(),
+        Some(3)
+    );
+    assert_eq!(
+        st.call(&key("s", "A")).unwrap().completed_event_id(),
+        Some(4)
+    );
 }
 
 #[test]
@@ -188,9 +194,11 @@ fn an_orphan_failure_keeps_its_input_and_error_and_names_no_before() {
     assert_eq!(
         st.call(&key("s", "lost")),
         Some(&Call {
-            before_event_id: None,
             tool: "Bash".into(),
-            completed_event_id: Some(2),
+            state: CallState::Completed {
+                before_event_id: None,
+                completed_event_id: 2
+            }
         })
     );
     // A late BeforeTool for the orphan is a repeat of a recorded call.
@@ -234,8 +242,14 @@ fn success_after_failure_and_failure_after_success_keep_the_first_completion() {
             is_interrupt: Some(true)
         })
     );
-    assert_eq!(st.call(&key("s", "F")).unwrap().completed_event_id, Some(3));
-    assert_eq!(st.call(&key("s", "S")).unwrap().completed_event_id, Some(4));
+    assert_eq!(
+        st.call(&key("s", "F")).unwrap().completed_event_id(),
+        Some(3)
+    );
+    assert_eq!(
+        st.call(&key("s", "S")).unwrap().completed_event_id(),
+        Some(4)
+    );
     assert_eq!(
         [stamp(&f1), stamp(&s1), stamp(&f2), stamp(&s2)],
         [vec![3, 0], vec![4, 0], vec![5, 0], vec![6, 0]]
@@ -249,7 +263,10 @@ fn a_repeated_failure_is_recorded_again_and_the_first_stays_authoritative() {
     let (st, again) = recorded(st, failed("slot-1", "s", "A", Some(true)));
     assert_eq!((first.event_id, again.event_id), (2, 3));
     assert_eq!(again.before_event_id, Some(1));
-    assert_eq!(st.call(&key("s", "A")).unwrap().completed_event_id, Some(2));
+    assert_eq!(
+        st.call(&key("s", "A")).unwrap().completed_event_id(),
+        Some(2)
+    );
 }
 
 #[test]
@@ -313,7 +330,7 @@ fn refused_failures_record_nothing_and_change_nothing() {
         assert!(reason.contains(want), "{reason:?} should contain {want:?}");
         st = next;
     }
-    assert_eq!(st.call(&key("s", "A")).unwrap().completed_event_id, None);
+    assert_eq!(st.call(&key("s", "A")).unwrap().completed_event_id(), None);
     assert_eq!(st.session_slot("s"), Some("slot-1"));
     // The corrected report is the call's first completion, at the id no refusal used.
     let (st, e) = recorded(st, Input::AfterTool(base));
@@ -321,7 +338,10 @@ fn refused_failures_record_nothing_and_change_nothing() {
         (e.event_id, e.before_event_id, stamp(&e)),
         (2, Some(1), vec![2, 0])
     );
-    assert_eq!(st.call(&key("s", "A")).unwrap().completed_event_id, Some(2));
+    assert_eq!(
+        st.call(&key("s", "A")).unwrap().completed_event_id(),
+        Some(2)
+    );
 }
 
 #[test]

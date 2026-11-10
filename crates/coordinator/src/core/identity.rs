@@ -19,14 +19,47 @@ pub struct CallKey {
 /// What the run remembers about a recorded call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Call {
-    /// The event id of the call's BeforeTool, or `None` when the coordinator first saw the call
-    /// through its AfterTool (an orphan completion, for example after a PreToolUse timeout).
-    pub before_event_id: Option<u64>,
     pub tool: String,
-    /// The event id of the call's first AfterTool, success or failure, which stays the
-    /// authoritative completion. A later report for the same call, with either outcome, is
-    /// recorded as its own event and changes nothing here.
-    pub completed_event_id: Option<u64>,
+    pub state: CallState,
+}
+
+/// Where a recorded call stands. A call enters as `Open` through its BeforeTool, or as
+/// `Completed` with no BeforeTool through an orphan AfterTool. `Open` moves to `Completed` on the
+/// call's first AfterTool, success or failure. `Completed` never changes: a later report for the
+/// same call is recorded as its own event and leaves the first completion in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallState {
+    /// The BeforeTool is recorded as `before_event_id`, and no AfterTool yet.
+    Open { before_event_id: u64 },
+    /// The first AfterTool is recorded as `completed_event_id`. `before_event_id` is `None` when
+    /// the coordinator first saw the call through that AfterTool (an orphan completion, for
+    /// example after a PreToolUse timeout).
+    Completed {
+        before_event_id: Option<u64>,
+        completed_event_id: u64,
+    },
+}
+
+impl Call {
+    /// The event id of the call's BeforeTool, `None` for an orphan completion.
+    pub fn before_event_id(&self) -> Option<u64> {
+        match self.state {
+            CallState::Open { before_event_id } => Some(before_event_id),
+            CallState::Completed {
+                before_event_id, ..
+            } => before_event_id,
+        }
+    }
+
+    /// The event id of the call's first AfterTool, `None` while the call is open.
+    pub fn completed_event_id(&self) -> Option<u64> {
+        match self.state {
+            CallState::Open { .. } => None,
+            CallState::Completed {
+                completed_event_id, ..
+            } => Some(completed_event_id),
+        }
+    }
 }
 
 /// Why a call's identity is refused. Nothing is recorded for a refused call.
@@ -82,9 +115,10 @@ impl Identities {
         }
         self.bind(slot, &key.session_id);
         let call = Call {
-            before_event_id: Some(event_id),
             tool: tool.to_owned(),
-            completed_event_id: None,
+            state: CallState::Open {
+                before_event_id: event_id,
+            },
         };
         self.calls.insert(key, call);
         Ok(())
@@ -116,12 +150,19 @@ impl Identities {
         }
         self.bind(slot, &key.session_id);
         let call = self.calls.entry(key).or_insert_with(|| Call {
-            before_event_id: None,
             tool: tool.to_owned(),
-            completed_event_id: None,
+            state: CallState::Completed {
+                before_event_id: None,
+                completed_event_id: event_id,
+            },
         });
-        call.completed_event_id.get_or_insert(event_id);
-        Ok(call.before_event_id)
+        if let CallState::Open { before_event_id } = call.state {
+            call.state = CallState::Completed {
+                before_event_id: Some(before_event_id),
+                completed_event_id: event_id,
+            };
+        }
+        Ok(call.before_event_id())
     }
 
     /// Record a lifecycle report's (Stop or SessionEnd) session for `slot`, which the caller has

@@ -15,7 +15,7 @@ pub mod snapshots;
 
 use std::collections::HashSet;
 
-use trace_store::{Event, EventKind};
+use trace_store::{Event, Stamp};
 
 use clocks::Clocks;
 pub use completion::{AfterTool, ToolResult};
@@ -226,23 +226,14 @@ fn before_tool(mut state: State, call: BeforeTool, now: i64) -> (State, Vec<Outp
         .clocks
         .tick(&call.slot)
         .expect("the slot is in the run: checked above");
-    let event = Event {
+    let stamp = Stamp {
         event_id,
         slot: call.slot,
         session_id: call.session_id,
         vclock: stamp.to_bytes(),
-        kind: EventKind::BeforeTool,
-        tool: Some(call.tool),
-        path: None,
-        payload_hash: None,
-        payload: Some(call.tool_input_json),
-        input_payload_hash: None,
-        input_payload: None,
-        tool_use_id: Some(call.tool_use_id),
-        before_event_id: None,
-        outcome: None,
         wall_time: now,
     };
+    let event = Event::before_tool(stamp, call.tool, call.tool_use_id, call.tool_input_json);
     state.next_event_id += 1;
     (
         state,

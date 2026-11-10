@@ -3,7 +3,7 @@
 //! and every refusal records nothing and changes nothing.
 
 use clock::Clock;
-use coordinator::core::identity::{Call, CallKey};
+use coordinator::core::identity::{Call, CallKey, CallState};
 use coordinator::core::{
     step, Ack, AfterTool, BeforeTool, Input, Output, RunConfig, State, ToolResult, Verdict,
 };
@@ -122,12 +122,17 @@ fn overlapping_calls_completed_in_reverse_order_pair_exactly() {
     assert_eq!(
         st.call(&key("s", "A")),
         Some(&Call {
-            before_event_id: Some(1),
             tool: "Edit".into(),
-            completed_event_id: Some(4),
+            state: CallState::Completed {
+                before_event_id: Some(1),
+                completed_event_id: 4
+            }
         })
     );
-    assert_eq!(st.call(&key("s", "B")).unwrap().completed_event_id, Some(3));
+    assert_eq!(
+        st.call(&key("s", "B")).unwrap().completed_event_id(),
+        Some(3)
+    );
 }
 
 #[test]
@@ -193,12 +198,14 @@ fn an_orphan_completion_keeps_its_input_and_is_never_guessed() {
     assert_eq!(
         st.call(&key("s", "t9")),
         Some(&Call {
-            before_event_id: None,
             tool: "Edit".into(),
-            completed_event_id: Some(2),
+            state: CallState::Completed {
+                before_event_id: None,
+                completed_event_id: 2
+            }
         })
     );
-    assert_eq!(st.call(&key("s", "t1")).unwrap().completed_event_id, None);
+    assert_eq!(st.call(&key("s", "t1")).unwrap().completed_event_id(), None);
     // A late BeforeTool for the orphan is a repeat of a recorded call.
     let (st, outputs) = step(st, before("slot-1", "s", "t9"), 0);
     assert!(
@@ -220,7 +227,7 @@ fn a_repeated_completion_is_recorded_again_and_the_first_stays_authoritative() {
     assert_ne!(first.event_id, again.event_id, "a separate event");
     assert_eq!(again.payload.as_deref(), Some("2"));
     assert_eq!(
-        st.call(&key("s", "t")).unwrap().completed_event_id,
+        st.call(&key("s", "t")).unwrap().completed_event_id(),
         Some(first.event_id),
         "not overwritten"
     );
@@ -229,7 +236,7 @@ fn a_repeated_completion_is_recorded_again_and_the_first_stays_authoritative() {
     let (st, o2) = recorded(st, after("slot-1", "s", "o"));
     assert_eq!((o1.before_event_id, o2.before_event_id), (None, None));
     assert_eq!(
-        st.call(&key("s", "o")).unwrap().completed_event_id,
+        st.call(&key("s", "o")).unwrap().completed_event_id(),
         Some(o1.event_id)
     );
 }
@@ -261,7 +268,7 @@ fn refused_reports_record_nothing_and_change_nothing() {
         assert!(reason.contains(why), "{why}: {reason}");
         st = next;
     }
-    assert_eq!(st.call(&key("s", "t")).unwrap().completed_event_id, None);
+    assert_eq!(st.call(&key("s", "t")).unwrap().completed_event_id(), None);
     assert_eq!(st.session_slot("s9"), None);
     // The refusals used nothing: the real completion is event 2 at [2, 0].
     let (_, a) = recorded(st, after("slot-1", "s", "t"));
@@ -286,7 +293,7 @@ fn an_orphan_with_no_tool_is_refused_and_its_corrected_retry_is_recorded() {
     no_tool.session_id = "s".into();
     no_tool.tool_use_id = "t".into();
     let (st, _) = refused(st, Input::AfterTool(no_tool));
-    assert_eq!(st.call(&key("s", "t")).unwrap().completed_event_id, None);
+    assert_eq!(st.call(&key("s", "t")).unwrap().completed_event_id(), None);
     // The corrected orphan retry gets the next unused id and stamp, and claims the call as Edit.
     let (st, orphan) = recorded(st, after("slot-2", "fresh", "o"));
     assert_eq!(
