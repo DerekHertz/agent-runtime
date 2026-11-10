@@ -82,7 +82,9 @@ The **hook shim** is the only agent-facing code. On every PreToolUse for Edit, W
 
 **The shim fails closed.** Claude Code lets a tool call proceed when a hook times out or exits with an ordinary error. So if the shim cannot reach the coordinator, or fails internally, it denies the call (exit 2). A Defer must always finish inside the hook's configured timeout.
 
-**Reports never block.** A report (PostToolUse and PostToolUseFailure now; Stop and SessionEnd later) comes after the fact, and exit 2 would only feed an error to the model or, for Stop, keep the session from stopping. So a report the shim cannot make, for any reason, exits 1 with the reason on stderr, and a recorded report exits 0 silently. The hook registration names its event (`art-shim --hook-event PostToolUse`), so the shim knows which policy applies before it reads its configuration or stdin; see `docs/hook-registration.md`. A report pairs with its call's BeforeTool by `(session_id, tool_use_id)` alone, never by its input, which a hook may have rewritten. A report for a call with no recorded BeforeTool (an orphan, for example after a PreToolUse timeout) is still recorded, with no BeforeTool, never paired with a guess. A PostToolUseFailure report (`art-shim --hook-event PostToolUseFailure`) pairs the same way and is recorded as an AfterTool with outcome `failure`: its payload is the raw JSON text of the hook's `error` string, and its interruption flag is kept as the hook sent it (`true`, `false`, or omitted). The hook's `error` must be a string and `is_interrupt`, when present, a boolean; the shim refuses any other type, `null` included, with exit 1. A call's first report, success or failure, is its completion; later reports of either outcome are recorded as events of their own.
+**Reports never block.** A report (PostToolUse, PostToolUseFailure, Stop or SessionEnd) comes after the fact, and exit 2 would only feed an error to the model or, for Stop, keep the session from stopping. So a report the shim cannot make, for any reason, exits 1 with the reason on stderr, and a recorded report exits 0 silently. The hook registration names its event (`art-shim --hook-event PostToolUse`), so the shim knows which policy applies before it reads its configuration or stdin; see `docs/hook-registration.md`. A report pairs with its call's BeforeTool by `(session_id, tool_use_id)` alone, never by its input, which a hook may have rewritten. A report for a call with no recorded BeforeTool (an orphan, for example after a PreToolUse timeout) is still recorded, with no BeforeTool, never paired with a guess. A PostToolUseFailure report (`art-shim --hook-event PostToolUseFailure`) pairs the same way and is recorded as an AfterTool with outcome `failure`: its payload is the raw JSON text of the hook's `error` string, and its interruption flag is kept as the hook sent it (`true`, `false`, or omitted). The hook's `error` must be a string and `is_interrupt`, when present, a boolean; the shim refuses any other type, `null` included, with exit 1. A call's first report, success or failure, is its completion; later reports of either outcome are recorded as events of their own.
+
+**Lifecycle reports.** A Stop or SessionEnd hook (`art-shim --hook-event Stop`, `art-shim --hook-event SessionEnd`) is recorded as an event of kind `Stop` or `SessionEnd` for the session's slot, like any report: it ticks the slot's clock once, binds a new session, and is refused (recorded nowhere) for an unknown slot or a session bound to another slot. It names no tool call. So it pairs with nothing and changes no recorded call, completion or binding: a completion reported after it still pairs with its BeforeTool, and an ended session still cannot move to another slot. A new session on the same slot continues the slot's clock. Recording one releases nothing: leases arrive with M2 (section 4), and a release will be an event of its own. The hook's `stop_hook_active`, `last_assistant_message` (Stop) and `reason` (SessionEnd) are kept as described under "Event schema"; each is optional, and when present must be a boolean or a string respectively, or the shim refuses the report (exit 1).
 
 **Slots and launching.** A launcher starts each session with environment variables naming its slot and the coordinator's socket, plus a settings file that registers the hooks. The coordinator maps each `session_id` to its slot, so a restarted session keeps its slot's clock. A session's first recorded event binds it to its slot for the rest of the run; a call that names the session under a different slot is refused and recorded nowhere. Within a session, Claude Code's `tool_use_id` names one tool call, so the coordinator refuses a second BeforeTool for the same `(session_id, tool_use_id)`. Without those variables the shim does nothing, so it never affects ordinary Claude Code sessions. The number of slots is fixed when a run starts.
 
@@ -156,10 +158,10 @@ This is what ties coherence and causality together: reading a file that agent A 
 | event_id     | u64    | monotonic per coordinator                                                              |
 | agent_id     | string | session or loop id                                                                     |
 | vclock       | bytes  | serialized vector, one u64 per agent                                                   |
-| kind         | enum   | BeforeTool, AfterTool, Acquire, Release, Invalidate, Barrier, Scatter, Gather          |
+| kind         | enum   | BeforeTool, AfterTool, Stop, SessionEnd, Acquire, Release, Invalidate, Barrier, Scatter, Gather. Kinds are additive: Stop and SessionEnd (lifecycle reports, section 3) were added with the hooks that record them; a reader refuses a kind it does not know |
 | tool         | string | Edit, Write, Bash, Read, etc.                                                          |
 | path         | string | file or symbol, if any                                                                 |
-| payload_hash | bytes  | hash of the tool input or output; the full content lives in a blob store keyed by hash. A BeforeTool's payload is its raw tool input, a successful AfterTool's its raw tool response (any JSON value, `null` included), a failed AfterTool's the raw JSON text of the hook's `error` string (`""` for an empty message) |
+| payload_hash | bytes  | hash of the tool input or output; the full content lives in a blob store keyed by hash. A BeforeTool's payload is its raw tool input, a successful AfterTool's its raw tool response (any JSON value, `null` included), a failed AfterTool's the raw JSON text of the hook's `error` string (`""` for an empty message). A Stop's or SessionEnd's payload is a JSON object holding exactly the lifecycle fields the hook carried, each value its raw JSON text, keys in this order: Stop `stop_hook_active` then `last_assistant_message`, SessionEnd `reason`. A field the hook omitted is absent, never filled in (`{}` when it carried none); other hook fields are not kept. For example `{"stop_hook_active":false,"last_assistant_message":"done"}` |
 | tool_use_id  | string | Claude Code's `tool_use_id` for tool events; with the session it pairs a BeforeTool with its AfterTool. Null in traces written before it existed |
 | before_event_id | u64 | AfterTool only: the `event_id` of the call's BeforeTool, null when none was recorded (an orphan). A repeated report names the same BeforeTool in a row of its own; the first one is the call's completion |
 | outcome      | enum   | AfterTool only: how the call ended, `success` (PostToolUse) or `failure` (PostToolUseFailure, a failed or interrupted call) |
@@ -212,6 +214,7 @@ service Coordinator {
   // Hook path, called by every agent's shim
   rpc BeforeTool(BeforeToolRequest) returns (Admission);
   rpc AfterTool(AfterToolReport) returns (Ack);
+  rpc Lifecycle(LifecycleReport) returns (Ack);  // Stop and SessionEnd
   rpc Release(ReleaseRequest) returns (Ack);
   // Bidirectional stream so the coordinator can push invalidations and barrier releases
   rpc Attach(stream AgentEvent) returns (stream CoordinatorEvent);
@@ -256,6 +259,21 @@ message ToolSuccess {
 message ToolFailure {
   string error_json = 1;          // raw hook `error`: the JSON text of a string, `""` for an empty message
   optional bool is_interrupt = 2; // hook `is_interrupt`; unset when the hook omitted it
+}
+
+// A session's Stop or SessionEnd hook. It names no tool call and releases nothing. An empty
+// session_id, an unspecified event or an empty fields_json is refused and records nothing.
+message LifecycleReport {
+  string slot = 1;
+  string session_id = 2;
+  LifecycleEvent event = 3;
+  string fields_json = 4; // the lifecycle fields the hook carried, as in section 5 (`{}` for none)
+}
+
+enum LifecycleEvent {
+  LIFECYCLE_EVENT_UNSPECIFIED = 0; // refused, never read as Stop
+  LIFECYCLE_EVENT_STOP = 1;
+  LIFECYCLE_EVENT_SESSION_END = 2;
 }
 
 message Ack {} // a refused report is an error status with the reason

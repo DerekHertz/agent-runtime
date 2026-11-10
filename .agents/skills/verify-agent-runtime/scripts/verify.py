@@ -16,6 +16,7 @@ import struct, subprocess, sys, tempfile, time, traceback
 sys.dont_write_bytecode = True  # importing the journey module must leave no __pycache__ in the skill
 import after_tool  # noqa: E402  the after-tool journey, in its own file (scripts/after_tool.py)
 import failed_tool  # noqa: E402  the failed-tool journey (scripts/failed_tool.py)
+import lifecycle  # noqa: E402  the lifecycle journey, Stop and SessionEnd (scripts/lifecycle.py)
 
 SCRIPT = pathlib.Path(__file__).resolve()
 SKILL = SCRIPT.parents[1]
@@ -26,6 +27,10 @@ FIXTURES = REPO / "crates/shim/tests/fixtures"
 ENV_VARS = ("AGENT_RUNTIME_SLOT", "AGENT_RUNTIME_SOCKET")
 MAX_SOCKET_PATH = 100  # macOS sun_path is 104 bytes including the NUL
 ALLOW = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow"}}
+# Hook JSON in FIXTURES (see its README.md): the *_synthetic ones were written by hand, not recorded.
+FIXTURE_NAMES = ("pre_tool_use_edit", "pre_tool_use_bash", "pre_tool_use_read", "pre_tool_use_write_synthetic",
+                 "pre_tool_use_notebook_edit_synthetic", "post_tool_use_edit", "post_tool_use_failure_bash",
+                 "stop", "session_end")
 
 
 def utc():
@@ -203,9 +208,7 @@ def doctor_checks(args):
     if bins["art-shim"].is_file():
         r = subprocess.run([str(bins["art-shim"])], input="", capture_output=True, text=True, env=clean_env(), timeout=10)
         add("art-shim with no env exits 0 silently", (r.returncode, r.stdout, r.stderr) == (0, "", ""), f"exit {r.returncode}")
-    fixtures = ("pre_tool_use_edit.json", "pre_tool_use_bash.json", "post_tool_use_edit.json",
-                "post_tool_use_failure_bash.json")
-    missing = [n for n in fixtures if not (FIXTURES / n).is_file()]
+    missing = [f"{n}.json" for n in FIXTURE_NAMES if not (FIXTURES / f"{n}.json").is_file()]
     add("hook fixtures present", not missing, f"missing {missing}" if missing else str(FIXTURES))
     add("python sqlite3 module", bool(sqlite3.sqlite_version), sqlite3.sqlite_version)
     root = pathlib.Path(args.scratch_root)
@@ -305,8 +308,7 @@ class Ctx:
         self.dir = ev / name
         self.dir.mkdir(parents=True)
         self.n, self.checks, self.commands = 0, [], []
-        self.fixtures = {k: (FIXTURES / f"{k}.json").read_text()
-                         for k in ("pre_tool_use_edit", "pre_tool_use_bash", "post_tool_use_edit", "post_tool_use_failure_bash")}
+        self.fixtures = {k: (FIXTURES / f"{k}.json").read_text() for k in FIXTURE_NAMES}
 
     def check(self, name, ok, **info):
         self.checks.append({"name": name, "passed": bool(ok), **info})
@@ -736,6 +738,7 @@ FEATURES = {
     "call-identity": j_call_identity,
     "after-tool": lambda c: after_tool.journey(c, sys.modules[__name__]),
     "failed-tool": lambda c: failed_tool.journey(c, sys.modules[__name__]),
+    "lifecycle": lambda c: lifecycle.journey(c, sys.modules[__name__]),
 }
 
 

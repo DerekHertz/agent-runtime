@@ -7,12 +7,14 @@
 use anyhow::{anyhow, bail, Context, Result};
 use runtime_proto::v1::after_tool_report::Result as ReportResult;
 use runtime_proto::v1::{
-    admission::Verdict, Admission, AfterToolReport, BeforeToolRequest, ToolFailure, ToolSuccess,
+    admission::Verdict, Admission, AfterToolReport, BeforeToolRequest, LifecycleReport,
+    ToolFailure, ToolSuccess,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::value::RawValue;
 
 use crate::cli::{HookEvent, Invocation};
+use crate::lifecycle;
 
 /// Prefix on every message the shim writes to stderr, so the model can tell why a call was blocked.
 const REASON_PREFIX: &str = "agent-runtime:";
@@ -40,6 +42,14 @@ struct HookInput {
     /// be `true` or `false`. Kept raw for the same reason as `error`.
     #[serde(default, deserialize_with = "present")]
     is_interrupt: Option<Box<RawValue>>,
+    /// Stop's raw `stop_hook_active`, `last_assistant_message`, and SessionEnd's raw `reason`
+    /// (see `lifecycle`). Kept raw for the same reason as `error`.
+    #[serde(default, deserialize_with = "present")]
+    stop_hook_active: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "present")]
+    last_assistant_message: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "present")]
+    reason: Option<Box<RawValue>>,
 }
 
 /// `Some` for any present value, `null` included. A plain `Option<Box<RawValue>>` would read an
@@ -56,6 +66,8 @@ pub enum Action {
     BeforeTool(BeforeToolRequest),
     /// Report this PostToolUse or PostToolUseFailure to the coordinator.
     AfterTool(AfterToolReport),
+    /// Report this Stop or SessionEnd to the coordinator.
+    Lifecycle(LifecycleReport),
     /// An event the legacy registration (no `--hook-event`) does not handle: exit 0 and print
     /// nothing. That registration is a PreToolUse gate only, so other events pass through
     /// silently, as before reports existed.
@@ -81,6 +93,14 @@ pub fn parse_input(stdin: &str, slot: &str, invocation: Invocation) -> Result<Ac
     let session_id = input
         .session_id
         .ok_or_else(|| anyhow!("{name} input has no session_id"))?;
+    if matches!(event, HookEvent::Stop | HookEvent::SessionEnd) {
+        let fields = lifecycle::Fields {
+            stop_hook_active: input.stop_hook_active.as_deref(),
+            last_assistant_message: input.last_assistant_message.as_deref(),
+            reason: input.reason.as_deref(),
+        };
+        return lifecycle::report(event, slot, session_id, &fields).map(Action::Lifecycle);
+    }
     let tool = input
         .tool_name
         .ok_or_else(|| anyhow!("{name} input has no tool_name"))?;
@@ -129,6 +149,8 @@ pub fn parse_input(stdin: &str, slot: &str, invocation: Invocation) -> Result<Ac
                 result: Some(ReportResult::Failure(failure)),
             }))
         }
+        // Returned above, before the tool fields are required.
+        HookEvent::Stop | HookEvent::SessionEnd => bail!("{name} is not a tool event"),
     }
 }
 
@@ -332,6 +354,8 @@ mod tests {
     const BASH: &str = include_str!("../tests/fixtures/pre_tool_use_bash.json");
     const POST: &str = include_str!("../tests/fixtures/post_tool_use_edit.json");
     const FAILURE: &str = include_str!("../tests/fixtures/post_tool_use_failure_bash.json");
+    const STOP: &str = include_str!("../tests/fixtures/stop.json");
+    const SESSION_END: &str = include_str!("../tests/fixtures/session_end.json");
 
     const LEGACY: Invocation = Invocation::Legacy;
     const PRE: Invocation = Invocation::Registered(HookEvent::PreToolUse);
@@ -639,6 +663,112 @@ mod tests {
         );
         let with_response = FAILURE.replace(r#""error""#, r#""tool_response":5,"error""#);
         assert_eq!(failed(&with_response).1.is_interrupt, Some(false));
+    }
+
+    fn lifecycle_of(stdin: &str, event: HookEvent) -> Result<LifecycleReport> {
+        match parse_input(stdin, "a", Invocation::Registered(event))? {
+            Action::Lifecycle(r) => Ok(r),
+            other => panic!("expected a lifecycle report, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_and_session_end_report_their_observed_fields() {
+        use runtime_proto::v1::LifecycleEvent;
+        let stop = lifecycle_of(STOP, HookEvent::Stop).unwrap();
+        assert_eq!(
+            (stop.slot.as_str(), stop.session_id.as_str(), stop.event),
+            (
+                "a",
+                "90c75de7-f344-4da3-9b24-152c5bfda374",
+                LifecycleEvent::Stop as i32
+            )
+        );
+        assert_eq!(
+            stop.fields_json,
+            r#"{"stop_hook_active":false,"last_assistant_message":"done"}"#
+        );
+        let end = lifecycle_of(SESSION_END, HookEvent::SessionEnd).unwrap();
+        assert_eq!(end.event, LifecycleEvent::SessionEnd as i32);
+        assert_eq!(end.fields_json, r#"{"reason":"other"}"#);
+        // A lifecycle event needs no tool fields; an omitted lifecycle field stays absent.
+        let bare = r#"{"hook_event_name":"Stop","session_id":"s"}"#;
+        assert_eq!(
+            lifecycle_of(bare, HookEvent::Stop).unwrap().fields_json,
+            "{}"
+        );
+    }
+
+    #[test]
+    fn a_lifecycle_report_needs_its_session_and_well_typed_fields() {
+        for (stdin, event) in [
+            (STOP, HookEvent::Stop),
+            (SESSION_END, HookEvent::SessionEnd),
+        ] {
+            let mut v: Value = serde_json::from_str(stdin).unwrap();
+            v.as_object_mut().unwrap().remove("session_id");
+            let err = lifecycle_of(&v.to_string(), event).unwrap_err();
+            assert!(format!("{err:#}").contains("session_id"), "{err:#}");
+        }
+        for (stdin, event, field, value) in [
+            (STOP, HookEvent::Stop, "stop_hook_active", json!(null)),
+            (STOP, HookEvent::Stop, "stop_hook_active", json!("false")),
+            (STOP, HookEvent::Stop, "last_assistant_message", json!(null)),
+            (SESSION_END, HookEvent::SessionEnd, "reason", json!(null)),
+            (SESSION_END, HookEvent::SessionEnd, "reason", json!(3)),
+        ] {
+            let mut v: Value = serde_json::from_str(stdin).unwrap();
+            v[field] = value;
+            let err = lifecycle_of(&v.to_string(), event).unwrap_err();
+            assert!(format!("{err:#}").contains(field), "{err:#}");
+        }
+    }
+
+    #[test]
+    fn lifecycle_registrations_take_only_their_own_event() {
+        for (stdin, event) in [
+            (STOP, HookEvent::SessionEnd),
+            (SESSION_END, HookEvent::Stop),
+            (POST, HookEvent::Stop),
+            (EDIT, HookEvent::SessionEnd),
+            (STOP, HookEvent::PostToolUse),
+            (SESSION_END, HookEvent::PostToolUseFailure),
+            (STOP, HookEvent::PreToolUse),
+        ] {
+            let err = parse_input(stdin, "a", Invocation::Registered(event)).unwrap_err();
+            assert!(format!("{err:#}").contains("registered for"), "{err:#}");
+        }
+        for stdin in [STOP, SESSION_END] {
+            assert_eq!(parse_input(stdin, "a", LEGACY).unwrap(), Action::Ignore);
+        }
+    }
+
+    #[test]
+    fn every_gated_tool_forwards_its_raw_input() {
+        for (stdin, tool) in [
+            (EDIT, "Edit"),
+            (BASH, "Bash"),
+            (
+                include_str!("../tests/fixtures/pre_tool_use_read.json"),
+                "Read",
+            ),
+            (
+                include_str!("../tests/fixtures/pre_tool_use_write_synthetic.json"),
+                "Write",
+            ),
+            (
+                include_str!("../tests/fixtures/pre_tool_use_notebook_edit_synthetic.json"),
+                "NotebookEdit",
+            ),
+        ] {
+            let r = before_tool(stdin);
+            assert_eq!(r.tool, tool);
+            assert!(
+                stdin.contains(&format!(r#""tool_input":{}"#, r.tool_input_json)),
+                "{tool}: {}",
+                r.tool_input_json
+            );
+        }
     }
 
     #[test]

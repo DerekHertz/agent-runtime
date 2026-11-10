@@ -31,3 +31,5 @@ tokio-stream.workspace = true
 clock.workspace = true
 coordinator.workspace = true
 trace-store.workspace = true
+# tests/e2e_acceptance.rs only: plant a conflicting row so a real INSERT fails.
+rusqlite.workspace = true

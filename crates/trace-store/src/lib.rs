@@ -43,10 +43,16 @@ pub const TRACE_FILE: &str = "trace.db";
 pub const LOCK_FILE: &str = "trace.lock";
 
 /// What kind of happening an [`Event`] records (SPEC section 5).
+///
+/// `Stop` and `SessionEnd` are lifecycle reports (issue #3 PR 6): a session's Stop or SessionEnd
+/// hook, recorded as an event of its slot. They carry no tool, no `tool_use_id` and no outcome,
+/// and they release nothing: a lease release is its own `Release` event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {
     BeforeTool,
     AfterTool,
+    Stop,
+    SessionEnd,
     Acquire,
     Release,
     Invalidate,
@@ -61,6 +67,8 @@ impl EventKind {
         match self {
             EventKind::BeforeTool => "BeforeTool",
             EventKind::AfterTool => "AfterTool",
+            EventKind::Stop => "Stop",
+            EventKind::SessionEnd => "SessionEnd",
             EventKind::Acquire => "Acquire",
             EventKind::Release => "Release",
             EventKind::Invalidate => "Invalidate",
@@ -74,6 +82,8 @@ impl EventKind {
         Some(match text {
             "BeforeTool" => EventKind::BeforeTool,
             "AfterTool" => EventKind::AfterTool,
+            "Stop" => EventKind::Stop,
+            "SessionEnd" => EventKind::SessionEnd,
             "Acquire" => EventKind::Acquire,
             "Release" => EventKind::Release,
             "Invalidate" => EventKind::Invalidate,
@@ -154,7 +164,9 @@ pub struct Event {
     /// The event's payload, exactly as the shim forwarded it: a BeforeTool's raw hook
     /// `tool_input` (kept so a run can be re-classified offline, SPEC section 7), a successful
     /// AfterTool's raw hook `tool_response`, a failed AfterTool's raw hook `error` (the JSON text
-    /// of a string, quotes and escapes included; never a synthesized envelope).
+    /// of a string, quotes and escapes included; never a synthesized envelope), and a Stop's or
+    /// SessionEnd's lifecycle fields: a JSON object holding exactly the fields the hook carried,
+    /// each value its raw JSON text (SPEC section 5).
     ///
     /// Given to [`TraceWriter::append`], it is the payload to store: the writer moves it into a
     /// blob and the row keeps only `payload_hash`. Read back with [`read_events`], it is `Some`
@@ -599,6 +611,8 @@ mod tests {
         let kinds = [
             EventKind::BeforeTool,
             EventKind::AfterTool,
+            EventKind::Stop,
+            EventKind::SessionEnd,
             EventKind::Acquire,
             EventKind::Release,
             EventKind::Invalidate,

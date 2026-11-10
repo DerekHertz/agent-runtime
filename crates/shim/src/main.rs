@@ -4,12 +4,14 @@
 //! slot variables) it does nothing. Inside a run, its registration (`cli`) fixes how it fails,
 //! before it reads its configuration or stdin: a PreToolUse gate fails closed, so every error,
 //! including a panic, ends in exit 2, because Claude Code lets the tool call proceed on a timeout
-//! or any other non-zero exit code. A PostToolUse or PostToolUseFailure report fails with a
-//! nonblocking exit 1 and a reason on stderr, and a recorded report exits 0 silently.
+//! or any other non-zero exit code. A report (PostToolUse, PostToolUseFailure, Stop or
+//! SessionEnd) fails with a nonblocking exit 1 and a reason on stderr, never 2 (on Stop that
+//! would keep the session from stopping), and a recorded report exits 0 silently.
 
 mod cli;
 mod config;
 mod hook;
+mod lifecycle;
 mod transport;
 
 use std::io::{Read, Write};
@@ -95,6 +97,12 @@ fn run(invocation: Result<Invocation, BadInvocation>, policy: Policy) -> Outcome
             match runtime.block_on(transport::after_tool(config.socket, report)) {
                 Ok(()) => Outcome::silent(),
                 Err(e) => policy.failure(format!("could not report the tool call: {e:#}")),
+            }
+        }
+        Action::Lifecycle(report) => {
+            match runtime.block_on(transport::lifecycle(config.socket, report)) {
+                Ok(()) => Outcome::silent(),
+                Err(e) => policy.failure(format!("could not report the lifecycle event: {e:#}")),
             }
         }
         Action::Ignore => Outcome::silent(),

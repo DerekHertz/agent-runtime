@@ -1,5 +1,6 @@
 //! The RPCs the shim makes over the coordinator's Unix domain socket: `BeforeTool` for a
-//! PreToolUse gate and `AfterTool` for a PostToolUse or PostToolUseFailure report.
+//! PreToolUse gate, `AfterTool` for a PostToolUse or PostToolUseFailure report, and `Lifecycle`
+//! for a Stop or SessionEnd report.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -9,6 +10,7 @@ use anyhow::{anyhow, Context, Result};
 use hyper_util::rt::TokioIo;
 use runtime_proto::v1::{
     coordinator_client::CoordinatorClient, Admission, AfterToolReport, BeforeToolRequest,
+    LifecycleReport,
 };
 use tokio::net::UnixStream;
 use tonic::transport::{Channel, Endpoint, Uri};
@@ -26,10 +28,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// coordinator. 80 s leaves 10 s of margin under the default.
 const CALL_TIMEOUT: Duration = Duration::from_secs(80);
 
-/// Longest a whole `AfterTool` report (connect plus RPC) may take. A report never waits on a
-/// lease, so it only bounds a hung coordinator. The documented PostToolUse registration
-/// (`docs/hook-registration.md`) sets a 30 s hook timeout, so the shim gives up and reports its
-/// own failure (exit 1) well before Claude Code would kill it.
+/// Longest a whole report (`AfterTool` or `Lifecycle`: connect plus RPC) may take. A report
+/// never waits on a lease, so it only bounds a hung coordinator. Every documented report
+/// registration (`docs/hook-registration.md`) sets a 30 s hook timeout, SessionEnd included
+/// (its 1.5 s default would kill the shim first), so the shim gives up and reports its own
+/// failure (exit 1) well before Claude Code would kill it.
 pub const REPORT_TIMEOUT: Duration = Duration::from_secs(10);
 
 async fn connect(socket: PathBuf) -> Result<CoordinatorClient<Channel>> {
@@ -73,6 +76,20 @@ pub async fn after_tool(socket: PathBuf, report: AfterToolReport) -> Result<()> 
             .after_tool(report)
             .await
             .map_err(|status| anyhow!("the coordinator's AfterTool call failed: {status}"))?;
+        Ok(())
+    })
+    .await
+}
+
+/// Report a Stop or SessionEnd, bounded like any report. `Ok` only once the coordinator has
+/// recorded it.
+pub async fn lifecycle(socket: PathBuf, report: LifecycleReport) -> Result<()> {
+    bounded(REPORT_TIMEOUT, async {
+        connect(socket)
+            .await?
+            .lifecycle(report)
+            .await
+            .map_err(|status| anyhow!("the coordinator's Lifecycle call failed: {status}"))?;
         Ok(())
     })
     .await

@@ -1,9 +1,10 @@
 ---------------------------- MODULE Admission ----------------------------
 (***************************************************************************)
 (* The recording path of the coordinator: CoordinatorService::            *)
-(* step_and_record in crates/coordinator/src/adapter.rs, which both RPCs   *)
-(* use. It runs core::step (a BeforeTool admission or an AfterTool         *)
-(* completion report) and appends the recorded event to the run's trace.   *)
+(* step_and_record in crates/coordinator/src/adapter.rs, which every RPC   *)
+(* uses. It runs core::step (a BeforeTool admission, an AfterTool          *)
+(* completion report, or a Stop or SessionEnd lifecycle report) and        *)
+(* appends the recorded event to the run's trace.                          *)
 (*                                                                         *)
 (* One TLA+ action is one indivisible step of that function. The mutex     *)
 (* `self.inner` is held from `lock()` until the guard drops when the       *)
@@ -14,7 +15,8 @@
 (*   Step          core::step(inner.state.clone(), input, now): for a      *)
 (*                 BeforeTool Identities::record_before, for an AfterTool  *)
 (*                 (a success or a failure) completion::after_tool and     *)
-(*                 Identities::record_after                                *)
+(*                 Identities::record_after, for a lifecycle report        *)
+(*                 lifecycle::lifecycle and Identities::record_lifecycle   *)
 (*   BlobOk        inside TraceWriter::append: one self.blobs.put returned *)
 (*                 Ok (the event's payload, or an AfterTool's input)       *)
 (*   BlobFails     that put returned Err: no row is inserted               *)
@@ -37,9 +39,11 @@ CONSTANTS
     Sessions,    \* the session_ids a call may carry
     UseIds,      \* the tool_use_ids a call may carry
     Tools,       \* the tool names a call may carry
-    Kinds,       \* the kinds a call may be: subset of {"B", "A", "F"} (BeforeTool, an
+    Kinds,       \* the kinds a call may be: subset of {"B", "A", "F", "L"} (BeforeTool, an
                  \* AfterTool of a success (PostToolUse), an AfterTool of a failure
-                 \* (PostToolUseFailure))
+                 \* (PostToolUseFailure), a lifecycle report (Stop or SessionEnd: one
+                 \* kind, because both take the same transition and differ only in the
+                 \* event kind written, which the real tests check))
     WithGhost,   \* TRUE: a call may name a slot that is not in the run
     WithSeed,    \* TRUE: the run may start with one BeforeTool already recorded
     Mutation     \* "none", or the name of a deliberately broken variant
@@ -49,6 +53,8 @@ AllSlots == IF WithGhost THEN Slots \cup {Ghost} ELSE Slots
 NoSlot == "unbound"
 NoTool == "-"
 NoBlob == "-"
+\* The tool_use_id of a lifecycle row: it names no call, so its rows are no call's rows.
+NoUse == "no-use"
 Keys == Sessions \X UseIds
 \* What the core remembers about one call: its BeforeTool's event id (0: none), its tool
 \* (NoTool: the call is unknown), and its first AfterTool's event id (0: not completed).
@@ -57,6 +63,8 @@ NoCall == [before |-> 0, tool |-> NoTool, done |-> 0]
 \* An AfterTool's response blob, and a failed AfterTool's error blob. Each call carries its own.
 Resp(k) == "resp-" \o k
 ErrBlob(k) == "err-" \o k
+\* A lifecycle report's fields blob. Each call carries its own, like a response.
+LifeBlob(k) == "life-" \o k
 
 VARIABLES
     slotOf,    \* [Calls -> AllSlots]: the slot each call names (never changes)
@@ -97,18 +105,23 @@ KeyOf(r) == <<r.session, r.use>>
 \* and go through the same pairing and completion code.
 IsAfter(k) == kindOf[k] \in {"A", "F"}
 
+\* Whether a call is a lifecycle report (Stop or SessionEnd).
+IsLife(k) == kindOf[k] = "L"
+
 \* The outcome a call's AfterTool row must carry: its report's ("-" for a BeforeTool). The
 \* interruption flag is part of a failure's outcome in the code; it is opaque data here, like the
 \* payload bytes, and its tri-state is checked by the real tests.
-ReportOutcome(k) == CASE kindOf[k] = "B" -> "-"
+ReportOutcome(k) == CASE kindOf[k] \in {"B", "L"} -> "-"
                       [] kindOf[k] = "A" -> "success"
                       [] kindOf[k] = "F" -> "failure"
 
 (* The blob a call's row names as its payload: a BeforeTool's input, a     *)
-(* successful AfterTool's response, a failed AfterTool's raw error.         *)
+(* successful AfterTool's response, a failed AfterTool's raw error, a       *)
+(* lifecycle report's fields.                                               *)
 PrimaryBlob(k) == CASE kindOf[k] = "B" -> payloadOf[k]
                     [] kindOf[k] = "A" -> Resp(k)
                     [] kindOf[k] = "F" -> ErrBlob(k)
+                    [] kindOf[k] = "L" -> LifeBlob(k)
 
 (* The outcome the row gets. Broken variant "failure_as_success": a failed  *)
 (* report is recorded as a success (the wire or core mapping drops the      *)
@@ -117,9 +130,9 @@ RowOutcome(k) == IF kindOf[k] = "F" /\ Mutation = "failure_as_success"
                  THEN "success" ELSE ReportOutcome(k)
 
 (* The writes TraceWriter::append makes for a recorded event, in order:    *)
-(* "blob" puts the payload (a response or an error), "input" puts an       *)
-(* AfterTool's input, "row" is                                             *)
-(* the INSERT. Broken variants: "row_before_blob" inserts first;           *)
+(* "blob" puts the payload (an input, a response, an error or lifecycle    *)
+(* fields), "input" puts an AfterTool's input, "row" is the INSERT. A      *)
+(* BeforeTool and a lifecycle report have one blob. Broken variants: "row_before_blob" inserts first;           *)
 (* "input_blob_after_row" puts an AfterTool's input after its row.         *)
 RowFirst == Mutation = "row_before_blob"
 Writes(k) ==
@@ -157,6 +170,10 @@ Init ==
     /\ useIdOf \in [Calls -> UseIds]
     /\ kindOf \in [Calls -> Kinds]
     /\ toolOf \in [Calls -> Tools]
+    \* A lifecycle report carries no tool, tool_use_id or tool input: fix those unused
+    \* constants to one value, so TLC does not explore copies that differ only there.
+    /\ \A k \in Calls : kindOf[k] = "L" =>
+         /\ useIdOf[k] = SeedUse /\ toolOf[k] = SeedTool /\ payloadOf[k] = SeedPayload
     /\ pc = [k \in Calls |-> "new"]
     /\ wr = [k \in Calls |-> 0]
     /\ holder = {}
@@ -215,16 +232,24 @@ Lock(k) ==
 (* writes the new binding and calls into inner.state at once, before the   *)
 (* append; "completion_before_append" does so for an AfterTool's calls     *)
 (* only.                                                                   *)
+(* A lifecycle report (kind "L") names no call: only an unknown slot or a  *)
+(* session bound to another slot refuses it (Identities::record_lifecycle).*)
+(* Admitted, it gets the next id and a tick, binds its session if new, and *)
+(* leaves every recorded call, completion and other binding as it was.     *)
+(* Its empty session or empty fields are refused by the same checks and   *)
+(* are not modeled separately.                                             *)
 Step(k) ==
     /\ pc[k] = "locked"
     /\ LET s == slotOf[k]
            x == sessionOf[k]
            c == <<x, useIdOf[k]>>
            isAfter == IsAfter(k)
+           isLife == IsLife(k)
            known == s \in Slots
            recorded == calls[c].tool # NoTool
            sameSlot == bound[x] \in {NoSlot, s} \/ Mutation = "no_binding_check"
-           fits == IF isAfter
+           fits == IF isLife THEN TRUE
+                   ELSE IF isAfter
                    THEN ~recorded \/ calls[c].tool = toolOf[k] \/ Mutation = "no_tool_check"
                    ELSE ~recorded \/ Mutation = "no_repeat_check"
            admitted == known /\ sameSlot /\ fits
@@ -239,10 +264,22 @@ Step(k) ==
            newCall == IF isAfter
                       THEN [before |-> pairs, tool |-> toolOf[k], done |-> doneOf]
                       ELSE [before |-> nextId, tool |-> toolOf[k], done |-> 0]
-           nbound == IF admitted THEN [bound EXCEPT ![x] = s] ELSE bound
-           ncalls == IF admitted THEN [calls EXCEPT ![c] = newCall] ELSE calls
-           yes == IF isAfter THEN "Ack" ELSE "Allow"
-           no == IF isAfter THEN "Refused" ELSE "Deny"
+           \* A lifecycle report binds its session on its first event and changes no
+           \* call. Broken variants: "lifecycle_unbinds" unbinds the session (a SessionEnd
+           \* that frees it for another slot); "lifecycle_forgets_calls" drops the
+           \* session's recorded calls (so a late completion would be an orphan).
+           nbound == IF ~admitted THEN bound
+                     ELSE IF isLife /\ Mutation = "lifecycle_unbinds"
+                     THEN [bound EXCEPT ![x] = NoSlot]
+                     ELSE [bound EXCEPT ![x] = s]
+           ncalls == IF ~admitted THEN calls
+                     ELSE IF isLife
+                     THEN IF Mutation = "lifecycle_forgets_calls"
+                          THEN [d \in Keys |-> IF d[1] = x THEN NoCall ELSE calls[d]]
+                          ELSE calls
+                     ELSE [calls EXCEPT ![c] = newCall]
+           yes == IF isAfter \/ isLife THEN "Ack" ELSE "Allow"
+           no == IF isAfter \/ isLife THEN "Refused" ELSE "Deny"
        IN /\ out' = [out EXCEPT ![k] =
                  IF admitted \/ (~known /\ Mutation = "record_unknown_slot")
                  THEN [has |-> TRUE, id |-> nextId, slot |-> s, stamp |-> stampOf,
@@ -332,11 +369,14 @@ AppendOk(k) ==
     /\ out[k].id \notin TraceIds
     /\ trace' = Append(trace, [id |-> out[k].id, slot |-> out[k].slot,
                                stamp |-> out[k].stamp, call |-> k,
-                               kind |-> IF IsAfter(k) THEN "A" ELSE "B",
+                               kind |-> IF IsAfter(k) THEN "A"
+                                        ELSE IF IsLife(k) THEN "L" ELSE "B",
                                blob |-> PrimaryBlob(k),
                                inBlob |-> IF IsAfter(k) THEN payloadOf[k] ELSE NoBlob,
-                               session |-> sessionOf[k], use |-> useIdOf[k],
-                               tool |-> toolOf[k], before |-> out[k].before,
+                               session |-> sessionOf[k],
+                               use |-> IF IsLife(k) THEN NoUse ELSE useIdOf[k],
+                               tool |-> IF IsLife(k) THEN NoTool ELSE toolOf[k],
+                               before |-> out[k].before,
                                outcome |-> RowOutcome(k)])
     /\ Advance(k)
     /\ UNCHANGED <<given, blobs, holder, core, out, reply, injected>>
@@ -635,5 +675,41 @@ MixedOutcomesReached ==
         /\ trace[i].before # 0 /\ trace[i].before = trace[j].before
         /\ \A k \in Calls : pc[k] = "done"
 MixedOutcomesNotReached == ~MixedOutcomesReached
+
+(* A lifecycle report of a session, then an AfterTool of that session that  *)
+(* pairs with a BeforeTool recorded before the lifecycle report: a late     *)
+(* completion after Stop or SessionEnd still pairs.                         *)
+LateCompletionAfterLifecycle ==
+    \E b, i, j \in DOMAIN trace :
+        /\ b < i /\ i < j
+        /\ trace[b].kind = "B" /\ trace[i].kind = "L" /\ trace[j].kind = "A"
+        /\ trace[i].session = trace[j].session
+        /\ KeyOf(trace[b]) = KeyOf(trace[j])
+        /\ trace[j].before = trace[b].id
+LateCompletionNotReached == ~LateCompletionAfterLifecycle
+
+(* A lifecycle report failed to persist, and the same session's lifecycle   *)
+(* report was then recorded with the failed one's id and stamp.             *)
+FailedLifecycleRetried ==
+    \E k1, k2 \in Calls :
+        /\ k1 # k2
+        /\ kindOf[k1] = "L" /\ kindOf[k2] = "L"
+        /\ reply[k1] = "Err" /\ reply[k2] = "Ack"
+        /\ sessionOf[k1] = sessionOf[k2]
+        /\ \E i \in DOMAIN trace :
+             /\ trace[i].call = k2 /\ trace[i].id = out[k1].id
+             /\ trace[i].stamp = out[k1].stamp
+LifecycleRetryNotReached == ~FailedLifecycleRetried
+
+(* After a lifecycle report, another session's event on the same slot takes *)
+(* the slot's next stamp: a new session continues its slot's clock.         *)
+NewSessionContinuesClock ==
+    \E i, j \in DOMAIN trace :
+        /\ i < j
+        /\ trace[i].kind = "L"
+        /\ trace[j].session # trace[i].session
+        /\ trace[j].slot = trace[i].slot
+        /\ trace[j].stamp = trace[i].stamp + 1
+NewSessionNotReached == ~NewSessionContinuesClock
 
 =============================================================================

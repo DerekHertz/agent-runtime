@@ -10,6 +10,7 @@ pub mod completion;
 pub mod defer;
 pub mod identity;
 pub mod leases;
+pub mod lifecycle;
 pub mod snapshots;
 
 use std::collections::HashSet;
@@ -19,6 +20,7 @@ use trace_store::{Event, EventKind};
 use clocks::Clocks;
 pub use completion::{AfterTool, ToolResult};
 use identity::{Call, CallKey, Identities};
+pub use lifecycle::{Lifecycle, LifecycleKind};
 
 /// The fixed set of slots a run is started with.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +100,8 @@ impl State {
 pub enum Input {
     BeforeTool(BeforeTool),
     AfterTool(AfterTool),
+    /// A Stop or SessionEnd report.
+    Lifecycle(Lifecycle),
 }
 
 /// A proposed tool call (PreToolUse), as the shim reports it.
@@ -120,12 +124,13 @@ pub enum Output {
     Record(Event),
     /// Answer a BeforeTool with this admission.
     Admit(Admission),
-    /// Answer an AfterTool report.
+    /// Answer an AfterTool or lifecycle report.
     Ack(Ack),
 }
 
-/// The coordinator's answer to an AfterTool report. A report cannot block anything (the tool has
-/// already run), so a refusal only tells the shim why nothing was recorded.
+/// The coordinator's answer to a report (AfterTool, Stop or SessionEnd). A report cannot block
+/// anything (the tool has already run, the turn or session is over), so a refusal only tells the
+/// shim why nothing was recorded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ack {
     Recorded,
@@ -172,16 +177,19 @@ impl Admission {
 
 /// Advance the coordinator by one input at wall time `now` (milliseconds since the Unix epoch,
 /// display only). Returns the next state and the effects to perform: at most one `Record`, then
-/// exactly one answer (`Admit` for a BeforeTool, `Ack` for an AfterTool).
+/// exactly one answer (`Admit` for a BeforeTool, `Ack` for a report).
 ///
 /// A refused input (unknown slot, empty tool, empty or rebound session, empty or repeated
-/// `tool_use_id`, an AfterTool naming another tool than its call) gets a Deny or a refused Ack, no `Record`, and
-/// the state back unchanged. The adapter commits the returned state only after the `Record` is
-/// appended, so a failed append binds no session, uses no call identity and completes no call.
+/// `tool_use_id`, an AfterTool naming another tool than its call, a lifecycle report without its
+/// fields) gets a Deny or a refused Ack, no `Record`, and the state back unchanged. The adapter
+/// commits the returned state only after the `Record` is appended, so a failed append binds no
+/// session, uses no call identity and completes no call. A Stop or SessionEnd changes no call,
+/// completion or binding other than binding its own session on its first event.
 pub fn step(state: State, input: Input, now: i64) -> (State, Vec<Output>) {
     match input {
         Input::BeforeTool(call) => before_tool(state, call, now),
         Input::AfterTool(report) => completion::after_tool(state, report, now),
+        Input::Lifecycle(report) => lifecycle::lifecycle(state, report, now),
     }
 }
 

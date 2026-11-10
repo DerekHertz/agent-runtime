@@ -1131,6 +1131,7 @@ dependencies = [
  "coordinator",
  "hyper-util",
  "runtime-proto",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# One command that checks the recording path of the coordinator (BeforeTool admissions and AfterTool
-# completion reports, successful and failed): TLC on formal/admission/Admission.tla plus the real-code tests. Run it from anywhere; it works on the checkout it lives in.
+# One command that checks the recording path of the coordinator (BeforeTool admissions, AfterTool
+# completion reports, successful and failed, and Stop and SessionEnd lifecycle reports): TLC on
+# formal/admission/Admission.tla plus the real-code tests. Run it from anywhere; it works on the
+# checkout it lives in.
 #
 #   formal/admission/check.sh            model + code
 #   formal/admission/check.sh --model    TLC only
@@ -105,6 +107,17 @@ if [ "$want_model" = 1 ]; then
     row "FAIL  model baseline: $(grep -m1 -E '^Error:' "$OUT/baseline.log") path: $(path_of "$OUT/baseline.log") (log $OUT/baseline.log)"
   fi
 
+  # The lifecycle baseline: the same rules with Stop and SessionEnd reports (kind L) among the calls.
+  tlc lifecycle AdmissionLifecycle.cfg
+  if grep -q "Model checking completed. No error has been found." "$OUT/lifecycle.log"; then
+    counts=$(grep -E "states generated, .* distinct states found" "$OUT/lifecycle.log" | sed 's/^ *//')
+    depth=$(sed -n 's/^The depth of the complete state graph search is \([0-9]*\)\./\1/p' "$OUT/lifecycle.log")
+    row "PASS  model lifecycle baseline: all rules hold with lifecycle reports ($counts; depth $depth)"
+  else
+    fail=1
+    row "FAIL  model lifecycle baseline: $(grep -m1 -E '^Error:' "$OUT/lifecycle.log") path: $(path_of "$OUT/lifecycle.log") (log $OUT/lifecycle.log)"
+  fi
+
   tlc witness AdmissionWitness.cfg
   if grep -q "Invariant WitnessNotReached is violated" "$OUT/witness.log"; then
     row "PASS  witness: the model reaches 'a call failed, the retry reused its id and stamp' ($(path_of "$OUT/witness.log"))"
@@ -133,7 +146,10 @@ if [ "$want_model" = 1 ]; then
               orphan-completion:AdmissionOrphanCompletionWitness:OrphanCompletionNotReached \
               out-of-order:AdmissionOutOfOrderWitness:OutOfOrderPairingNotReached \
               failure-retry:AdmissionFailureRetryWitness:FailureRetryNotReached \
-              mixed-outcome:AdmissionMixedOutcomeWitness:MixedOutcomesNotReached; do
+              mixed-outcome:AdmissionMixedOutcomeWitness:MixedOutcomesNotReached \
+              late-completion:AdmissionLateCompletionWitness:LateCompletionNotReached \
+              lifecycle-retry:AdmissionLifecycleRetryWitness:LifecycleRetryNotReached \
+              new-session:AdmissionNewSessionWitness:NewSessionNotReached; do
     name=${spec%%:*}; rest=${spec#*:}; cfg=${rest%%:*}; inv=${rest#*:}
     tlc "$name-witness" "$cfg.cfg"
     if grep -q "Invariant $inv is violated" "$OUT/$name-witness.log"; then
@@ -154,7 +170,8 @@ if [ "$want_model" = 1 ]; then
               input_blob_after_row:RowsNameStoredBlobs no_tool_check:CallKeepsItsTool \
               guess_before:AfterPairsWithItsBefore last_completion:CoreMatchesTrace \
               completion_before_append:CoreMatchesTrace \
-              failure_as_success:RowKeepsItsOutcome success_only_completion:CoreMatchesTrace; do
+              failure_as_success:RowKeepsItsOutcome success_only_completion:CoreMatchesTrace \
+              lifecycle_forgets_calls:AfterPairsWithItsBefore lifecycle_unbinds:SessionStaysOnSlot; do
     m=${pair%%:*}; rule=${pair##*:}
     tlc "mutant-$m" "mutants/$m.cfg"
     if grep -q "Invariant $rule is violated" "$OUT/mutant-$m.log"; then
@@ -179,7 +196,8 @@ if [ "$want_model" = 1 ]; then
 fi
 
 # ---------------------------------------------------------------------------------------------
-# 3. Real code: the adapter's failed-append unit tests, the admission, AfterTool and failure tests
+# 3. Real code: the adapter's failed-append unit tests, the admission, AfterTool, failure and
+#    lifecycle durability tests
 # ---------------------------------------------------------------------------------------------
 if [ "$want_code" = 1 ]; then
   mkdir -p "$OUT"
@@ -187,8 +205,9 @@ if [ "$want_code" = 1 ]; then
   if cargo test -p coordinator --lib adapter::tests::failed_ --offline --locked >"$OUT/cargo-lib.log" 2>&1 \
      && grep -q "test adapter::tests::failed_append_keeps_the_old_state ... ok" "$OUT/cargo-lib.log" \
      && grep -q "test adapter::tests::failed_after_tool_append_completes_nothing ... ok" "$OUT/cargo-lib.log" \
-     && grep -q "test adapter::tests::failed_failure_report_append_completes_nothing ... ok" "$OUT/cargo-lib.log"; then
-    row "PASS  code: adapter::tests::failed_append_keeps_the_old_state, failed_after_tool_append_completes_nothing, failed_failure_report_append_completes_nothing"
+     && grep -q "test adapter::tests::failed_failure_report_append_completes_nothing ... ok" "$OUT/cargo-lib.log" \
+     && grep -q "test adapter::tests::failed_lifecycle_append_binds_nothing_and_keeps_the_calls ... ok" "$OUT/cargo-lib.log"; then
+    row "PASS  code: adapter::tests::failed_append_keeps_the_old_state, failed_after_tool_append_completes_nothing, failed_failure_report_append_completes_nothing, failed_lifecycle_append_binds_nothing_and_keeps_the_calls"
   else
     fail=1
     row "FAIL  code: adapter::tests::failed_* (log $OUT/cargo-lib.log)"
@@ -213,6 +232,13 @@ if [ "$want_code" = 1 ]; then
   else
     fail=1
     row "FAIL  code: tests/failure_durability.rs: $(grep -E '^test .* FAILED|^error' "$OUT/cargo-failure.log" | head -3 | tr '\n' ' ')(log $OUT/cargo-failure.log)"
+  fi
+  if cargo test -p coordinator --test lifecycle_durability --offline --locked >"$OUT/cargo-lifecycle.log" 2>&1 \
+     && grep -q "test result: ok. 5 passed" "$OUT/cargo-lifecycle.log"; then
+    row "PASS  code: tests/lifecycle_durability.rs (5 tests)"
+  else
+    fail=1
+    row "FAIL  code: tests/lifecycle_durability.rs: $(grep -E '^test .* FAILED|^error' "$OUT/cargo-lifecycle.log" | head -3 | tr '\n' ' ')(log $OUT/cargo-lifecycle.log)"
   fi
 fi
 

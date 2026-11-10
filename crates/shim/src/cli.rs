@@ -4,18 +4,20 @@
 //! launcher writes, so it is trusted in a way stdin is not: it fixes how the shim fails before
 //! the shim reads its configuration or stdin, or can panic. A PreToolUse gate fails closed
 //! (exit 2), because Claude Code lets a tool call through on any other failure. A report
-//! (PostToolUse, PostToolUseFailure) fails with a nonblocking exit 1, because the tool has
-//! already run and exit 2 would only feed an error back to the model, or for Stop, keep the
-//! session from stopping.
+//! (PostToolUse, PostToolUseFailure, Stop, SessionEnd) fails with a nonblocking exit 1: the tool
+//! has already run, so exit 2 would only feed an error back to the model, and on Stop it would
+//! keep the session from stopping.
 //!
 //! - `art-shim`: the issue #2 registration, a PreToolUse gate. Other events pass through.
 //! - `art-shim --hook-event PreToolUse`: a PreToolUse gate. Any other event is an error.
 //! - `art-shim --hook-event PostToolUse`: a PostToolUse report. Any other event is an error.
 //! - `art-shim --hook-event PostToolUseFailure`: a failed or interrupted call's report. Any other
 //!   event is an error.
+//! - `art-shim --hook-event Stop`, `art-shim --hook-event SessionEnd`: lifecycle reports. Any
+//!   other event is an error.
 //!
-//! Once `--hook-event` names a report event (PostToolUse, PostToolUseFailure, or one a later
-//! build handles), every command-line error is nonblocking, trailing arguments included.
+//! Once `--hook-event` names a report event, every command-line error is nonblocking, trailing
+//! arguments included.
 
 use std::ffi::OsString;
 
@@ -27,22 +29,40 @@ pub enum HookEvent {
     PreToolUse,
     PostToolUse,
     PostToolUseFailure,
+    Stop,
+    SessionEnd,
 }
 
 impl HookEvent {
+    /// Every event, for parsing the command line.
+    const ALL: [HookEvent; 5] = [
+        HookEvent::PreToolUse,
+        HookEvent::PostToolUse,
+        HookEvent::PostToolUseFailure,
+        HookEvent::Stop,
+        HookEvent::SessionEnd,
+    ];
+
     /// The `hook_event_name` Claude Code sends for this event.
     pub fn name(self) -> &'static str {
         match self {
             HookEvent::PreToolUse => "PreToolUse",
             HookEvent::PostToolUse => "PostToolUse",
             HookEvent::PostToolUseFailure => "PostToolUseFailure",
+            HookEvent::Stop => "Stop",
+            HookEvent::SessionEnd => "SessionEnd",
         }
     }
 
+    /// Only the PreToolUse gate blocks. Every report, Stop included, is nonblocking: exit 2 on
+    /// Stop would keep the session from stopping.
     pub fn policy(self) -> Policy {
         match self {
             HookEvent::PreToolUse => Policy::FailClosed,
-            HookEvent::PostToolUse | HookEvent::PostToolUseFailure => Policy::Nonblocking,
+            HookEvent::PostToolUse
+            | HookEvent::PostToolUseFailure
+            | HookEvent::Stop
+            | HookEvent::SessionEnd => Policy::Nonblocking,
         }
     }
 }
@@ -72,36 +92,13 @@ pub struct BadInvocation {
     pub policy: Policy,
 }
 
-/// Report events later issue #3 PRs handle. Registering one with this build is an error, but a
-/// nonblocking one: a report must never block, whichever build runs it.
-const LATER_REPORT_EVENTS: [&str; 2] = ["Stop", "SessionEnd"];
-
-/// What the value after `--hook-event` names, read before anything else is checked.
-enum Hint<'a> {
-    Known(HookEvent),
-    LaterReport(&'a str),
-    Unknown,
-}
-
-impl Hint<'_> {
-    fn of(value: &OsString) -> Hint<'_> {
-        match value.to_str() {
-            Some("PreToolUse") => Hint::Known(HookEvent::PreToolUse),
-            Some("PostToolUse") => Hint::Known(HookEvent::PostToolUse),
-            Some("PostToolUseFailure") => Hint::Known(HookEvent::PostToolUseFailure),
-            Some(later) if LATER_REPORT_EVENTS.contains(&later) => Hint::LaterReport(later),
-            _ => Hint::Unknown,
-        }
-    }
-
-    /// How a command line with this hint fails. Only a recognized report event is nonblocking.
-    fn policy(&self) -> Policy {
-        match self {
-            Hint::Known(event) => event.policy(),
-            Hint::LaterReport(_) => Policy::Nonblocking,
-            Hint::Unknown => Policy::FailClosed,
-        }
-    }
+/// What the value after `--hook-event` names, read before anything else is checked: an event
+/// this build handles (exact, case-sensitive name), or `None`.
+fn hint(value: &OsString) -> Option<HookEvent> {
+    let value = value.to_str()?;
+    HookEvent::ALL
+        .into_iter()
+        .find(|event| event.name() == value)
 }
 
 /// Parse the arguments after the program name.
@@ -128,20 +125,17 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Invocation, Bad
     let Some((value, extra)) = rest.split_first() else {
         return Err(fail_closed("--hook-event needs an event".into()));
     };
-    let hint = Hint::of(value);
+    let hint = hint(value);
     if !extra.is_empty() {
         return Err(BadInvocation {
             reason: format!("unexpected arguments after --hook-event {value:?}: {extra:?}"),
-            policy: hint.policy(),
+            // Only a recognized report event is nonblocking; anything else may be a gate.
+            policy: hint.map_or(Policy::FailClosed, HookEvent::policy),
         });
     }
     match hint {
-        Hint::Known(event) => Ok(Invocation::Registered(event)),
-        Hint::LaterReport(later) => Err(BadInvocation {
-            reason: format!("this art-shim does not report {later} hooks yet"),
-            policy: Policy::Nonblocking,
-        }),
-        Hint::Unknown => Err(fail_closed(format!("unknown hook event {value:?}"))),
+        Some(event) => Ok(Invocation::Registered(event)),
+        None => Err(fail_closed(format!("unknown hook event {value:?}"))),
     }
 }
 
@@ -176,19 +170,29 @@ mod tests {
     }
 
     #[test]
-    fn a_later_report_event_fails_without_blocking() {
-        for event in LATER_REPORT_EVENTS {
-            let err = parse_strs(&["--hook-event", event]).unwrap_err();
-            assert_eq!(err.policy, Policy::Nonblocking, "{event}");
-            assert!(err.reason.contains(event), "{}", err.reason);
+    fn stop_and_session_end_are_nonblocking_reports() {
+        for (name, event) in [
+            ("Stop", HookEvent::Stop),
+            ("SessionEnd", HookEvent::SessionEnd),
+        ] {
+            let parsed = parse_strs(&["--hook-event", name]).unwrap();
+            assert_eq!(parsed, Invocation::Registered(event));
+            assert_eq!(parsed.policy(), Policy::Nonblocking, "{name}");
+            assert_eq!(event.name(), name);
+        }
+    }
+
+    #[test]
+    fn every_event_parses_back_from_its_own_name() {
+        for event in HookEvent::ALL {
+            let parsed = parse_strs(&["--hook-event", event.name()]).unwrap();
+            assert_eq!(parsed, Invocation::Registered(event));
         }
     }
 
     #[test]
     fn trailing_arguments_after_a_report_event_fail_without_blocking() {
-        let reports = ["PostToolUse", "PostToolUseFailure"]
-            .into_iter()
-            .chain(LATER_REPORT_EVENTS);
+        let reports = ["PostToolUse", "PostToolUseFailure", "Stop", "SessionEnd"];
         for event in reports {
             for extra in [&["extra"][..], &["--hook-event", "PreToolUse"], &[""]] {
                 let mut args = vec!["--hook-event", event];
@@ -209,6 +213,8 @@ mod tests {
             &["--hook-event", "posttooluse", "extra"],
             &["--hook-event", "PostToolUseFailures", "extra"],
             &["--hook-event", "posttoolusefailure", "extra"],
+            &["--hook-event", "stop", "extra"],
+            &["--hook-event", "Session_End", "extra"],
         ] {
             let err = parse_strs(args).unwrap_err();
             assert_eq!(err.policy, Policy::FailClosed, "{args:?}");
@@ -220,6 +226,9 @@ mod tests {
         for args in [
             &["--hook-event"][..],
             &["--hook-event", "posttooluse"],
+            &["--hook-event", "stop"],
+            &["--hook-event", "sessionend"],
+            &["--hook-event", "SubagentStop"],
             &["--hook-event", ""],
             &["--event", "PostToolUse"],
             &["--event", "PostToolUse", "extra"],

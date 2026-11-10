@@ -80,7 +80,7 @@ impl Identities {
                 tool_use_id: key.tool_use_id,
             });
         }
-        self.bind(slot, &key);
+        self.bind(slot, &key.session_id);
         let call = Call {
             before_event_id: Some(event_id),
             tool: tool.to_owned(),
@@ -114,7 +114,7 @@ impl Identities {
                 });
             }
         }
-        self.bind(slot, &key);
+        self.bind(slot, &key.session_id);
         let call = self.calls.entry(key).or_insert_with(|| Call {
             before_event_id: None,
             tool: tool.to_owned(),
@@ -122,6 +122,18 @@ impl Identities {
         });
         call.completed_event_id.get_or_insert(event_id);
         Ok(call.before_event_id)
+    }
+
+    /// Record a lifecycle report's (Stop or SessionEnd) session for `slot`, which the caller has
+    /// checked is in the run: refuse an empty or rebound session, else bind it on its first
+    /// event. A lifecycle report names no call, so the recorded calls, their completions and every
+    /// binding stay as they are: a SessionEnd does not unbind its session or forget its calls, so
+    /// a late completion still pairs and the session cannot move to another slot. All or nothing:
+    /// on `Err` nothing has changed.
+    pub fn record_lifecycle(&mut self, slot: &str, session_id: &str) -> Result<(), Refusal> {
+        self.check_slot(slot, session_id)?;
+        self.bind(slot, session_id);
+        Ok(())
     }
 
     /// Refuse empty ids and a session bound to another slot. Changes nothing.
@@ -132,18 +144,26 @@ impl Identities {
         if key.tool_use_id.is_empty() {
             return Err(Refusal::EmptyToolUseId);
         }
-        match self.slot_of.get(&key.session_id) {
+        self.check_slot(slot, &key.session_id)
+    }
+
+    /// Refuse an empty session and a session bound to another slot. Changes nothing.
+    fn check_slot(&self, slot: &str, session_id: &str) -> Result<(), Refusal> {
+        if session_id.is_empty() {
+            return Err(Refusal::EmptySession);
+        }
+        match self.slot_of.get(session_id) {
             Some(bound) if bound != slot => Err(Refusal::OtherSlot {
-                session_id: key.session_id.clone(),
+                session_id: session_id.to_owned(),
                 bound: bound.clone(),
             }),
             _ => Ok(()),
         }
     }
 
-    fn bind(&mut self, slot: &str, key: &CallKey) {
+    fn bind(&mut self, slot: &str, session_id: &str) {
         self.slot_of
-            .entry(key.session_id.clone())
+            .entry(session_id.to_owned())
             .or_insert_with(|| slot.to_owned());
     }
 
