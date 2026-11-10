@@ -35,8 +35,10 @@ use rusqlite::{params, Connection, OpenFlags};
 mod blobs;
 mod body;
 mod durable_dir;
+mod run;
 pub use blobs::{read_blob, BlobError, BlobHash, BlobStore, BLOBS_DIR};
 pub use body::{Body, ShapeError, Stamp};
+pub use run::{ConcurrentWrites, Run, RunError, RunEvent};
 
 /// File name of the trace inside a run directory.
 pub const TRACE_FILE: &str = "trace.db";

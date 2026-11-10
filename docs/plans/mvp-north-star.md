@@ -22,7 +22,7 @@ Each rung is one small PR that ends in a check someone can run. A rung is climbe
 | 1 | [#3](https://github.com/DerekHertz/agent-runtime/issues/3) PR 6: Stop and SessionEnd | Issue #3's five criteria pass in `e2e_acceptance.rs`; `verify.py drive all`; `formal/admission/check.sh` | climbed 2026-11-10 |
 | 2 | Land the issue #3 stack (PRs #15 to #19 and PR 6) | All six merged to `main`, CI green | climbed 2026-11-10 (merge of #23) |
 | 3 | Model the domain: `Call` as an enum of its three states; `Event` built by per-kind constructors and read through `Event::body` | Workspace tests and `check.sh --code` pass with no behavior change | climbed 2026-11-10 |
-| 4 | [#4](https://github.com/DerekHertz/agent-runtime/issues/4) Causal queries | `art query concurrent-writes` lists a planted pair in a fixture trace | not started |
+| 4 | [#4](https://github.com/DerekHertz/agent-runtime/issues/4) Causal queries | `art query concurrent-writes` lists a planted pair in a fixture trace | climbed 2026-11-10 |
 | 5 | [#6](https://github.com/DerekHertz/agent-runtime/issues/6) Launcher | `art run` with a two-slot run file puts both sessions' hook events in one trace | not started |
 | 6 | [#7](https://github.com/DerekHertz/agent-runtime/issues/7) **M1 run** (Derek starts it) | Goal check 1 | not started |
 | 7 | [#5](https://github.com/DerekHertz/agent-runtime/issues/5) Knowledge channels, cut to the Read channel and the lease-clock merge on Deny | A Read after another slot's write and release orders that write before the reader's next event | not started |
