@@ -191,6 +191,34 @@ async fn an_unknown_slot_is_denied_without_a_row_or_an_id() {
     assert_eq!(events[0].event_id, 1);
 }
 
+/// An empty tool is invalid wire input, refused like the model's `NoRecord`: a Deny, no row, no
+/// blob, no id, and the call's `(session_id, tool_use_id)` stays free for the corrected retry.
+#[tokio::test]
+async fn an_empty_tool_is_denied_without_a_row_and_its_retry_is_event_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let svc = service(tmp.path(), &["slot-1", "slot-2"]);
+    let mut bad = request("slot-1", "call-1").into_inner();
+    bad.tool = String::new();
+    let denied = svc
+        .before_tool(Request::new(bad))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(denied.verdict, Verdict::Deny as i32);
+    assert!(denied.reason.contains("no tool"), "{}", denied.reason);
+    assert!(trace(tmp.path()).is_empty());
+    assert!(blob_files(tmp.path()).is_empty());
+
+    // Same session and tool_use_id, other slot: the session was not bound, the call not claimed.
+    let retry = request_in("slot-2", "session-of-slot-1", "call-1");
+    let allowed = svc.before_tool(retry).await.unwrap().into_inner();
+    assert_eq!(allowed.verdict, Verdict::Allow as i32, "{}", allowed.reason);
+    let events = trace(tmp.path());
+    assert_eq!(events.len(), 1);
+    assert_eq!((events[0].event_id, stamp(&events[0])), (1, vec![0, 1]));
+    assert_eq!(events[0].tool.as_deref(), Some("Edit"));
+}
+
 /// Model actions `Lock` .. `Unlock` of many calls at once; rules (a) at the end, (b), (d), (e).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_calls_get_consecutive_ids_and_increasing_stamps_and_never_collide() {

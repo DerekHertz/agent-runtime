@@ -5,9 +5,14 @@
 //! extraction"), and shim-facing messages carry no clocks.
 
 use anyhow::{anyhow, bail, Context, Result};
-use runtime_proto::v1::{admission::Verdict, Admission, BeforeToolRequest};
-use serde::{Deserialize, Serialize};
+use runtime_proto::v1::after_tool_report::Result as ReportResult;
+use runtime_proto::v1::{
+    admission::Verdict, Admission, AfterToolReport, BeforeToolRequest, ToolSuccess,
+};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::value::RawValue;
+
+use crate::cli::{HookEvent, Invocation};
 
 /// Prefix on every message the shim writes to stderr, so the model can tell why a call was blocked.
 const REASON_PREFIX: &str = "agent-runtime:";
@@ -18,9 +23,22 @@ struct HookInput {
     hook_event_name: String,
     session_id: Option<String>,
     tool_name: Option<String>,
-    /// Kept as raw JSON so the coordinator receives the agent's input byte for byte.
+    /// Kept as raw JSON so the coordinator receives the agent's input byte for byte. `None` when
+    /// the field is absent; an explicit `null` is not a tool input and counts as absent.
+    #[serde(default, deserialize_with = "present")]
     tool_input: Option<Box<RawValue>>,
+    /// A PostToolUse's raw response. `None` only when the field is absent: an explicit `null` is
+    /// a response like any other JSON value, so it is kept as the raw text `null`.
+    #[serde(default, deserialize_with = "present")]
+    tool_response: Option<Box<RawValue>>,
     tool_use_id: Option<String>,
+}
+
+/// `Some` for any present value, `null` included. A plain `Option<Box<RawValue>>` would read an
+/// explicit `null` as `None`, losing a valid tool response; `#[serde(default)]` gives `None` only
+/// for an absent field.
+fn present<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Box<RawValue>>, D::Error> {
+    Box::<RawValue>::deserialize(d).map(Some)
 }
 
 /// What to do with a hook invocation.
@@ -28,42 +46,71 @@ struct HookInput {
 pub enum Action {
     /// Ask the coordinator about this PreToolUse.
     BeforeTool(BeforeToolRequest),
-    /// An event the shim does not handle yet: exit 0 and print nothing.
-    ///
-    /// PostToolUse, PostToolUseFailure, Stop and SessionEnd reporting arrives in a later issue.
-    /// Until then these events pass through silently; they are reports, not gates, so there is
-    /// nothing to fail closed on.
+    /// Report this PostToolUse to the coordinator.
+    AfterTool(AfterToolReport),
+    /// An event the legacy registration (no `--hook-event`) does not handle: exit 0 and print
+    /// nothing. That registration is a PreToolUse gate only, so other events pass through
+    /// silently, as before reports existed.
     Ignore,
 }
 
-/// Parse the hook's stdin for the shim running as `slot`.
-pub fn parse_input(stdin: &str, slot: &str) -> Result<Action> {
+/// Parse the hook's stdin for the shim running as `slot`, invoked as `invocation`. A registered
+/// event must match the stdin's `hook_event_name`.
+pub fn parse_input(stdin: &str, slot: &str, invocation: Invocation) -> Result<Action> {
     let input: HookInput =
         serde_json::from_str(stdin).context("hook input is not a valid hook JSON object")?;
-    if input.hook_event_name != "PreToolUse" {
-        return Ok(Action::Ignore);
-    }
+    let event = match invocation {
+        Invocation::Legacy if input.hook_event_name == "PreToolUse" => HookEvent::PreToolUse,
+        Invocation::Legacy => return Ok(Action::Ignore),
+        Invocation::Registered(event) if event.name() == input.hook_event_name => event,
+        Invocation::Registered(event) => bail!(
+            "the shim is registered for {} but received a {:?} event",
+            event.name(),
+            input.hook_event_name
+        ),
+    };
+    let name = event.name();
     let session_id = input
         .session_id
-        .ok_or_else(|| anyhow!("PreToolUse input has no session_id"))?;
+        .ok_or_else(|| anyhow!("{name} input has no session_id"))?;
     let tool = input
         .tool_name
-        .ok_or_else(|| anyhow!("PreToolUse input has no tool_name"))?;
+        .ok_or_else(|| anyhow!("{name} input has no tool_name"))?;
     let tool_input = input
         .tool_input
-        .ok_or_else(|| anyhow!("PreToolUse input has no tool_input"))?;
+        .filter(|raw| raw.get() != "null")
+        .ok_or_else(|| anyhow!("{name} input has no tool_input"))?;
     let tool_use_id = input
         .tool_use_id
-        .ok_or_else(|| anyhow!("PreToolUse input has no tool_use_id"))?;
-    let intent = intent(&tool, &tool_input);
-    Ok(Action::BeforeTool(BeforeToolRequest {
-        slot: slot.to_owned(),
-        session_id,
-        tool,
-        tool_input_json: tool_input.get().to_owned(),
-        intent,
-        tool_use_id,
-    }))
+        .ok_or_else(|| anyhow!("{name} input has no tool_use_id"))?;
+    match event {
+        HookEvent::PreToolUse => {
+            let intent = intent(&tool, &tool_input);
+            Ok(Action::BeforeTool(BeforeToolRequest {
+                slot: slot.to_owned(),
+                session_id,
+                tool,
+                tool_input_json: tool_input.get().to_owned(),
+                intent,
+                tool_use_id,
+            }))
+        }
+        HookEvent::PostToolUse => {
+            let response = input
+                .tool_response
+                .ok_or_else(|| anyhow!("{name} input has no tool_response"))?;
+            Ok(Action::AfterTool(AfterToolReport {
+                slot: slot.to_owned(),
+                session_id,
+                tool,
+                tool_input_json: tool_input.get().to_owned(),
+                tool_use_id,
+                result: Some(ReportResult::Success(ToolSuccess {
+                    tool_response_json: response.get().to_owned(),
+                })),
+            }))
+        }
+    }
 }
 
 /// The agent's stated intent: a Bash call's `description` when it is a string, else empty.
@@ -101,12 +148,49 @@ impl Outcome {
     }
 
     /// Block the call. Exit 2 is the only failure code Claude Code treats as a block; every other
-    /// non-zero code lets the call proceed, so every failure path in the shim must come here.
+    /// non-zero code lets the call proceed, so every failure path of a gate must come here.
     pub fn fail_closed(reason: impl std::fmt::Display) -> Self {
         Outcome {
             stdout: None,
             stderr: Some(format!("{REASON_PREFIX} {reason}")),
             code: 2,
+        }
+    }
+
+    /// A report that could not be made: exit 1, a nonblocking error that Claude Code shows in its
+    /// transcript, with the reason on stderr and nothing on stdout. Never exit 2, which would feed
+    /// the error to the model (PostToolUse) or keep a session from stopping (Stop).
+    pub fn report_failed(reason: impl std::fmt::Display) -> Self {
+        Outcome {
+            stdout: None,
+            stderr: Some(format!("{REASON_PREFIX} {reason}")),
+            code: 1,
+        }
+    }
+}
+
+/// How the shim fails, fixed by its registration before anything can go wrong (see `cli`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Policy {
+    /// A PreToolUse gate: exit 2, which blocks the call.
+    FailClosed,
+    /// A report: exit 1, which blocks nothing.
+    Nonblocking,
+}
+
+impl Policy {
+    /// The exit code of a failure under this policy.
+    pub fn code(self) -> u8 {
+        match self {
+            Policy::FailClosed => 2,
+            Policy::Nonblocking => 1,
+        }
+    }
+
+    pub fn failure(self, reason: impl std::fmt::Display) -> Outcome {
+        match self {
+            Policy::FailClosed => Outcome::fail_closed(reason),
+            Policy::Nonblocking => Outcome::report_failed(reason),
         }
     }
 }
@@ -203,11 +287,35 @@ mod tests {
     const BASH: &str = include_str!("../tests/fixtures/pre_tool_use_bash.json");
     const POST: &str = include_str!("../tests/fixtures/post_tool_use_edit.json");
 
+    const LEGACY: Invocation = Invocation::Legacy;
+    const PRE: Invocation = Invocation::Registered(HookEvent::PreToolUse);
+    const REPORT: Invocation = Invocation::Registered(HookEvent::PostToolUse);
+
     fn before_tool(stdin: &str) -> BeforeToolRequest {
-        match parse_input(stdin, "a").unwrap() {
+        match parse_input(stdin, "a", LEGACY).unwrap() {
             Action::BeforeTool(r) => r,
-            Action::Ignore => panic!("expected a BeforeTool action"),
+            other => panic!("expected a BeforeTool action, got {other:?}"),
         }
+    }
+
+    fn after_tool(stdin: &str) -> AfterToolReport {
+        match parse_input(stdin, "a", REPORT).unwrap() {
+            Action::AfterTool(r) => r,
+            other => panic!("expected an AfterTool action, got {other:?}"),
+        }
+    }
+
+    fn response(report: &AfterToolReport) -> &str {
+        match &report.result {
+            Some(ReportResult::Success(s)) => &s.tool_response_json,
+            None => panic!("a report always carries its result"),
+        }
+    }
+
+    fn post(tool_response: &str) -> String {
+        format!(
+            r#"{{"hook_event_name":"PostToolUse","session_id":"s","tool_name":"Edit","tool_input":{{"z": 1,  "a":[1, 2]}},"tool_response": {tool_response} ,"tool_use_id":"t"}}"#
+        )
     }
 
     fn json_of(outcome: &Outcome) -> Value {
@@ -266,16 +374,32 @@ mod tests {
     }
 
     #[test]
-    fn other_events_are_ignored() {
-        assert_eq!(parse_input(POST, "a").unwrap(), Action::Ignore);
+    fn the_legacy_registration_ignores_other_events() {
+        assert_eq!(parse_input(POST, "a", LEGACY).unwrap(), Action::Ignore);
         let stop = r#"{"hook_event_name":"Stop","session_id":"s"}"#;
-        assert_eq!(parse_input(stop, "a").unwrap(), Action::Ignore);
+        assert_eq!(parse_input(stop, "a", LEGACY).unwrap(), Action::Ignore);
+    }
+
+    #[test]
+    fn a_registered_event_must_match_the_input() {
+        match parse_input(EDIT, "a", PRE).unwrap() {
+            Action::BeforeTool(r) => assert_eq!(r, before_tool(EDIT)),
+            other => panic!("{other:?}"),
+        }
+        for (stdin, invocation) in [(POST, PRE), (EDIT, REPORT)] {
+            let err = parse_input(stdin, "a", invocation).unwrap_err();
+            assert!(format!("{err:#}").contains("registered for"), "{err:#}");
+        }
+        let stop = r#"{"hook_event_name":"Stop","session_id":"s"}"#;
+        assert!(parse_input(stop, "a", REPORT).is_err());
     }
 
     #[test]
     fn malformed_input_is_an_error() {
-        for bad in ["", "not json", "[]", r#"{"session_id":"s"}"#] {
-            assert!(parse_input(bad, "a").is_err(), "{bad:?}");
+        for invocation in [LEGACY, PRE, REPORT] {
+            for bad in ["", "not json", "[]", r#"{"session_id":"s"}"#] {
+                assert!(parse_input(bad, "a", invocation).is_err(), "{bad:?}");
+            }
         }
     }
 
@@ -284,7 +408,75 @@ mod tests {
         for missing in ["session_id", "tool_name", "tool_input", "tool_use_id"] {
             let mut v: Value = serde_json::from_str(EDIT).unwrap();
             v.as_object_mut().unwrap().remove(missing);
-            assert!(parse_input(&v.to_string(), "a").is_err(), "{missing}");
+            assert!(
+                parse_input(&v.to_string(), "a", LEGACY).is_err(),
+                "{missing}"
+            );
+        }
+        let mut v: Value = serde_json::from_str(EDIT).unwrap();
+        v["tool_input"] = Value::Null;
+        assert!(
+            parse_input(&v.to_string(), "a", LEGACY).is_err(),
+            "null input"
+        );
+    }
+
+    #[test]
+    fn post_tool_use_reports_the_raw_input_and_response() {
+        let r = after_tool(POST);
+        let hook: Value = serde_json::from_str(POST).unwrap();
+        assert_eq!(r.slot, "a");
+        assert_eq!(r.session_id, hook["session_id"]);
+        assert_eq!(r.tool, "Edit");
+        assert_eq!(r.tool_use_id, hook["tool_use_id"]);
+        assert_eq!(
+            r.tool_input_json,
+            r#"{"file_path":"/work/src/lib.rs","old_string":"a","new_string":"b","replace_all":false}"#
+        );
+        assert_eq!(response(&r), r#"{"filePath":"/work/src/lib.rs"}"#);
+    }
+
+    #[test]
+    fn every_json_response_is_kept_verbatim_including_null() {
+        for raw in [
+            "null",
+            "0",
+            "-1.5e3",
+            r#""text""#,
+            "true",
+            "[ ]",
+            r#"{"b": 1,  "a":null}"#,
+        ] {
+            let r = after_tool(&post(raw));
+            assert_eq!(response(&r), raw);
+            assert_eq!(r.tool_input_json, r#"{"z": 1,  "a":[1, 2]}"#);
+        }
+    }
+
+    #[test]
+    fn post_tool_use_missing_fields_is_an_error() {
+        for missing in [
+            "session_id",
+            "tool_name",
+            "tool_input",
+            "tool_response",
+            "tool_use_id",
+        ] {
+            let mut v: Value = serde_json::from_str(POST).unwrap();
+            v.as_object_mut().unwrap().remove(missing);
+            let err = parse_input(&v.to_string(), "a", REPORT).unwrap_err();
+            assert!(format!("{err:#}").contains(missing), "{err:#}");
+        }
+    }
+
+    #[test]
+    fn policies_pick_the_exit_code() {
+        let gate = Policy::FailClosed.failure("x");
+        let report = Policy::Nonblocking.failure("x");
+        assert_eq!((gate.code, report.code), (2, 1));
+        for o in [gate, report] {
+            assert_eq!(o.stdout, None);
+            assert_eq!(o.stderr.as_deref(), Some("agent-runtime: x"));
         }
     }
 

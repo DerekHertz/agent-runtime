@@ -19,8 +19,12 @@ fn event(id: u64, tool_use_id: Option<&str>) -> Event {
         tool: Some("Edit".into()),
         path: None,
         payload_hash: None,
-        tool_input: Some(format!(r#"{{"call":{id}}}"#)),
+        payload: Some(format!(r#"{{"call":{id}}}"#)),
+        input_payload_hash: None,
+        input_payload: None,
         tool_use_id: tool_use_id.map(str::to_owned),
+        before_event_id: None,
+        outcome: None,
         wall_time: 0,
     }
 }

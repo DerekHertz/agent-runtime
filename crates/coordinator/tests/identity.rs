@@ -43,6 +43,7 @@ fn run(st: State, input: Input) -> (State, Vec<Event>, Admission) {
                 assert!(admission.is_none(), "exactly one admission per input");
                 admission = Some(a);
             }
+            Output::Ack(ack) => panic!("a BeforeTool is answered with an admission: {ack:?}"),
         }
     }
     (st, events, admission.expect("every input is answered"))
@@ -119,8 +120,9 @@ fn a_repeated_before_tool_is_refused() {
     assert_eq!(
         st.call(&key("sess-a", "toolu_1")),
         Some(&Call {
-            before_event_id: first.event_id,
-            tool: "Edit".into()
+            before_event_id: Some(first.event_id),
+            tool: "Edit".into(),
+            completed_event_id: None,
         }),
         "the first call stays the recorded one"
     );
@@ -142,7 +144,7 @@ fn equal_tool_use_ids_in_different_sessions_are_different_calls() {
             st.call(&key(session, "toolu_same"))
                 .unwrap()
                 .before_event_id,
-            id
+            Some(id)
         );
     }
 }
@@ -157,11 +159,11 @@ fn overlapping_calls_of_one_session_keep_their_own_before_events() {
     assert_eq!(e2.tool_use_id.as_deref(), Some("toolu_2"));
     assert_eq!(
         st.call(&key("sess-a", "toolu_1")).unwrap().before_event_id,
-        e1.event_id
+        Some(e1.event_id)
     );
     assert_eq!(
         st.call(&key("sess-a", "toolu_2")).unwrap().before_event_id,
-        e2.event_id
+        Some(e2.event_id)
     );
 }
 
@@ -180,6 +182,23 @@ fn an_empty_session_or_tool_use_id_is_refused_and_binds_nothing() {
     // So the session can still start on another slot.
     let (st, e) = allowed(st, before("slot-2", "sess-a", "toolu_1"));
     assert_eq!(stamp(&e), vec![0, 1]);
+    assert_eq!(st.session_slot("sess-a"), Some("slot-2"));
+}
+
+#[test]
+fn an_empty_tool_is_refused_and_does_not_claim_the_call() {
+    let Input::BeforeTool(mut call) = before("slot-1", "sess-a", "toolu_1") else {
+        unreachable!()
+    };
+    call.tool = String::new();
+    let (st, reason) = refused(state(), Input::BeforeTool(call));
+    assert!(reason.contains("no tool"), "{reason}");
+    assert_eq!(st.session_slot("sess-a"), None, "binds no session");
+    assert_eq!(st.call(&key("sess-a", "toolu_1")), None, "claims no call");
+    // The corrected retry, same ids, on the other slot: the first event of a fresh run.
+    let (st, e) = allowed(st, before("slot-2", "sess-a", "toolu_1"));
+    assert_eq!((e.event_id, stamp(&e)), (1, vec![0, 1]));
+    assert_eq!(e.tool.as_deref(), Some("Edit"));
     assert_eq!(st.session_slot("sess-a"), Some("slot-2"));
 }
 

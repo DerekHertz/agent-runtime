@@ -82,6 +82,8 @@ The **hook shim** is the only agent-facing code. On every PreToolUse for Edit, W
 
 **The shim fails closed.** Claude Code lets a tool call proceed when a hook times out or exits with an ordinary error. So if the shim cannot reach the coordinator, or fails internally, it denies the call (exit 2). A Defer must always finish inside the hook's configured timeout.
 
+**Reports never block.** A report (PostToolUse now; PostToolUseFailure, Stop and SessionEnd later) comes after the fact, and exit 2 would only feed an error to the model or, for Stop, keep the session from stopping. So a report the shim cannot make, for any reason, exits 1 with the reason on stderr, and a recorded report exits 0 silently. The hook registration names its event (`art-shim --hook-event PostToolUse`), so the shim knows which policy applies before it reads its configuration or stdin; see `docs/hook-registration.md`. A report pairs with its call's BeforeTool by `(session_id, tool_use_id)` alone, never by its input, which a hook may have rewritten. A report for a call with no recorded BeforeTool (an orphan, for example after a PreToolUse timeout) is still recorded, with no BeforeTool, never paired with a guess.
+
 **Slots and launching.** A launcher starts each session with environment variables naming its slot and the coordinator's socket, plus a settings file that registers the hooks. The coordinator maps each `session_id` to its slot, so a restarted session keeps its slot's clock. A session's first recorded event binds it to its slot for the rest of the run; a call that names the session under a different slot is refused and recorded nowhere. Within a session, Claude Code's `tool_use_id` names one tool call, so the coordinator refuses a second BeforeTool for the same `(session_id, tool_use_id)`. Without those variables the shim does nothing, so it never affects ordinary Claude Code sessions. The number of slots is fixed when a run starts.
 
 The **own-loop adapter** implements the same two calls (`BeforeTool`, `AfterTool`) from inside a Rust agent loop that calls the Claude API directly. Both adapters produce identical trace events, so the coordinator and viewer never know which one is running. The city simulator is built using this runtime, which is the dogfood path described under Milestones.
@@ -157,8 +159,11 @@ This is what ties coherence and causality together: reading a file that agent A 
 | kind         | enum   | BeforeTool, AfterTool, Acquire, Release, Invalidate, Barrier, Scatter, Gather          |
 | tool         | string | Edit, Write, Bash, Read, etc.                                                          |
 | path         | string | file or symbol, if any                                                                 |
-| payload_hash | bytes  | hash of the tool input or output; the full content lives in a blob store keyed by hash |
+| payload_hash | bytes  | hash of the tool input or output; the full content lives in a blob store keyed by hash. A BeforeTool's payload is its raw tool input, an AfterTool's its raw tool response (any JSON value, `null` included) |
 | tool_use_id  | string | Claude Code's `tool_use_id` for tool events; with the session it pairs a BeforeTool with its AfterTool. Null in traces written before it existed |
+| before_event_id | u64 | AfterTool only: the `event_id` of the call's BeforeTool, null when none was recorded (an orphan). A repeated report names the same BeforeTool in a row of its own; the first one is the call's completion |
+| outcome      | enum   | AfterTool only: how the call ended (`success`; failed and interrupted calls are added with PostToolUseFailure) |
+| input_payload_hash | bytes | AfterTool only: hash of the raw tool input the report carried, which may differ from the BeforeTool's; kept so an orphan's input is not lost |
 | wall_time    | i64    | for display only, never for ordering                                                   |
 
 **Layout.** Each run has its own directory, `runs/<run-id>/`, containing `trace.db` (SQLite, append-only, written only by the coordinator) and `blobs/` (content-addressed by blake3). Queries do not run in SQL. A run is loaded into memory (`Run::load(dir)`) and queried with pure methods. A later live-tail adapter will serve the viewer.
@@ -219,6 +224,8 @@ service Orchestration {
 }
 
 // No clocks in shim-facing messages: the coordinator holds every slot's clock (section 5).
+// An empty slot, session_id, tool or tool_use_id is denied and records nothing, so the call's
+// (session_id, tool_use_id) stays free for a corrected retry.
 message BeforeToolRequest {
   string slot = 1;
   string session_id = 2;
@@ -227,6 +234,24 @@ message BeforeToolRequest {
   string intent = 5;          // Bash `description` when present, else empty; agents are never prompted for it
   string tool_use_id = 6;     // hook tool_use_id; with session_id it names the call (pairs it with its AfterTool)
 }
+
+// Every field is required: an empty string or an unset `result` is refused, never read as a default.
+message AfterToolReport {
+  string slot = 1;
+  string session_id = 2;
+  string tool = 3;
+  string tool_input_json = 4; // raw hook tool_input reported with the completion
+  string tool_use_id = 5;
+  oneof result {
+    ToolSuccess success = 6;  // PostToolUse; a failed or interrupted call arrives with a later field
+  }
+}
+
+message ToolSuccess {
+  string tool_response_json = 1; // raw hook tool_response, any JSON value including `null`
+}
+
+message Ack {} // a refused report is an error status with the reason
 
 message Admission {
   enum Verdict { ALLOW = 0; DENY = 1; DEFER = 2; }

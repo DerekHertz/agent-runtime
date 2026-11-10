@@ -72,3 +72,7 @@ _Avoid_: timestamp (wall time is for display only)
 
 **Knowledge channel**:
 One of the few ways one agent's clock can absorb another's: reading a file, building or testing the whole tree, being denied by a lease holder, or passing a barrier. Nothing else carries knowledge between agents.
+
+**Completion**:
+The AfterTool event recording that a tool call ended, paired with the call's BeforeTool by its session and `tool_use_id`, never by its input. A call's first completion is the authoritative one; a repeated report is recorded as an event of its own. An **orphan** completion is one whose BeforeTool the coordinator never recorded; it keeps its input and names no BeforeTool.
+_Avoid_: result (when you mean the event), response (that is the tool's output, the completion's payload)

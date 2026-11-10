@@ -1,8 +1,8 @@
 // Source of truth for the shim <-> coordinator protocol (docs/SPEC.md section 7).
 //
-// Only the RPC that issue #2 needs is defined here. AfterTool, Release, Attach and the
-// Orchestration service arrive with the issues that implement them, so their message shapes
-// are not guessed ahead of time.
+// Only the RPCs implemented so far are defined here. Release, Attach and the Orchestration
+// service arrive with the issues that implement them, so their message shapes are not guessed
+// ahead of time.
 syntax = "proto3";
 
 package agent_runtime.v1;
@@ -10,6 +10,7 @@ package agent_runtime.v1;
 service Coordinator {
   // Hook path, called by every agent's shim.
   rpc BeforeTool(BeforeToolRequest) returns (Admission);
+  rpc AfterTool(AfterToolReport) returns (Ack);
 }
 
 // No clocks in shim-facing messages: the coordinator holds every slot's clock (section 5).
@@ -33,3 +34,26 @@ message Admission {
   string owner = 3;
   string updated_input_json = 4; // set when a Read is redirected to a released snapshot
 }
+
+// A tool call's completion report (PostToolUse). The coordinator pairs it with the call's
+// BeforeTool by (session_id, tool_use_id). Every field is required: an empty string or an unset
+// `result` is refused, never read as a default.
+message AfterToolReport {
+  string slot = 1;
+  string session_id = 2;
+  string tool = 3;
+  string tool_input_json = 4; // raw hook tool_input reported with the completion
+  string tool_use_id = 5;
+  oneof result {
+    ToolSuccess success = 6;
+    // A failed or interrupted call (PostToolUseFailure) arrives with a later field.
+  }
+}
+
+// PostToolUse: the tool returned a response.
+message ToolSuccess {
+  string tool_response_json = 1; // raw hook tool_response, any JSON value including `null`
+}
+
+// The report was recorded. A refused report is an error status with the reason.
+message Ack {}

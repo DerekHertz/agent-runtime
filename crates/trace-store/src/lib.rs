@@ -2,25 +2,29 @@
 //! (SPEC section 5, "Event schema" and "Layout").
 //!
 //! The coordinator is the only writer. This slice has a writer, a minimal in-order reader for
-//! tests and tooling ([`read_events`], [`read_payload`]), and the run's blob store
-//! ([`BlobStore`]); the in-memory query layer (`Run::load`, `happens_before`, ...) arrives with a
-//! later issue.
+//! tests and tooling ([`read_events`], [`read_payload`], [`read_input_payload`]), and the run's
+//! blob store ([`BlobStore`]); the in-memory query layer (`Run::load`, `happens_before`, ...)
+//! arrives with a later issue.
 //!
-//! Payloads: [`TraceWriter::append`] stores an event's raw tool input as a blob in
-//! `runs/<run-id>/blobs/` and only then inserts the row, which keeps the blob's hash in
-//! `payload_hash` and leaves `tool_input` NULL. So a row never names a blob that is missing or
-//! not yet flushed; an append whose INSERT fails can leave an orphan blob, which nothing reads.
-//! Traces written before blobs (issue #2) keep the raw input inline in `tool_input`;
-//! [`read_payload`] reads either form.
+//! Payloads: an event handed to [`TraceWriter::append`] carries its payload bytes, and the writer
+//! stores them as blobs in `runs/<run-id>/blobs/` and only then inserts the row, which keeps only
+//! their hashes. A BeforeTool's payload is its raw tool input. An AfterTool's payload is its raw
+//! tool response, and the raw tool input reported with it is a second blob named by
+//! `input_payload_hash`, so a completion whose BeforeTool was never recorded still keeps its
+//! input. So a row never names a blob that is missing or not yet flushed; an append whose INSERT
+//! fails can leave orphan blobs, which nothing reads. Traces written before blobs (issue #2) keep
+//! the raw input inline in the `tool_input` column; [`read_payload`] reads either form.
 //!
-//! Call identity: a tool event's row keeps Claude Code's `tool_use_id`. Traces written before it
-//! existed (issue #2 and issue #3 PR 2) have no such column; [`read_events`] reads them with
-//! `tool_use_id` `None` and never adds the column. A writer adds it only to an empty trace.
+//! Columns added after issue #2: `tool_use_id` (issue #3 PR 3), then `before_event_id`, `outcome`
+//! and `input_payload_hash` (issue #3 PR 4, AfterTool). [`read_events`] reads a trace that lacks
+//! any of them with `None` in its place and never adds a column. A writer adds them only to an
+//! empty trace.
 //!
 //! File-system assumptions: when the writer starts, it flushes the run directory and every
 //! directory on its canonical path up to its filesystem's anchor (the topmost directory on the
-//! same device), whether or not it created them. Blob durability relies on the OS and drive honouring `fsync` (`F_FULLFSYNC`
-//! on macOS), as described in the `blobs` module. Rows rely on SQLite's default durability.
+//! same device), whether or not it created them. Blob durability relies on the OS and drive
+//! honouring `fsync` (`F_FULLFSYNC` on macOS), as described in the `blobs` module. Rows rely on
+//! SQLite's default durability.
 
 use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
@@ -80,6 +84,30 @@ impl EventKind {
     }
 }
 
+/// How a tool call ended, as its AfterTool reports it. Only success exists so far; failed and
+/// interrupted calls (PostToolUseFailure) are a later PR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// PostToolUse: the tool ran and returned a response.
+    Success,
+}
+
+impl Outcome {
+    /// The text stored in the `outcome` column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Outcome::Success => "success",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "success" => Some(Outcome::Success),
+            _ => None,
+        }
+    }
+}
+
 /// One row of the trace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
@@ -97,17 +125,33 @@ pub struct Event {
     /// [`TraceWriter::append`] sets it: an event handed to `append` with a hash is refused, so
     /// every hash in the trace names a blob the writer stored and flushed first.
     pub payload_hash: Option<Vec<u8>>,
-    /// The raw hook `tool_input` JSON, exactly as the shim forwarded it, so a run can be
-    /// re-classified offline (SPEC section 7).
+    /// The event's payload, exactly as the shim forwarded it: a BeforeTool's raw hook
+    /// `tool_input` (kept so a run can be re-classified offline, SPEC section 7), an AfterTool's
+    /// raw hook `tool_response`.
     ///
     /// Given to [`TraceWriter::append`], it is the payload to store: the writer moves it into a
     /// blob and the row keeps only `payload_hash`. Read back with [`read_events`], it is `Some`
-    /// only for rows written before blobs (issue #2 traces), which kept it inline. Use
-    /// [`read_payload`] to get the bytes from either form.
-    pub tool_input: Option<String>,
+    /// only for rows written before blobs (issue #2 traces), which kept the tool input inline in
+    /// the `tool_input` column. Use [`read_payload`] to get the bytes from either form.
+    pub payload: Option<String>,
+    /// The hash of the raw `tool_input` an AfterTool reported, stored like `payload_hash` and set
+    /// only by [`TraceWriter::append`]. It is separate from `payload_hash` so the input survives
+    /// even when no BeforeTool was recorded, and so the input of a paired call is stored once.
+    pub input_payload_hash: Option<Vec<u8>>,
+    /// Given to [`TraceWriter::append`]: an AfterTool's raw hook `tool_input`, which the writer
+    /// stores as a blob named by `input_payload_hash`. Always `None` when read back; use
+    /// [`read_input_payload`].
+    pub input_payload: Option<String>,
     /// Claude Code's `tool_use_id` for a tool event; with `session_id` it names the call. `None`
     /// for events without one and for every row of a trace written before the column existed.
     pub tool_use_id: Option<String>,
+    /// For an AfterTool, the `event_id` of the BeforeTool of the same call, `None` when the
+    /// coordinator recorded no BeforeTool for it (an orphan completion). `None` for every other
+    /// kind and for traces written before the column existed.
+    pub before_event_id: Option<u64>,
+    /// For an AfterTool, how the call ended. `None` for every other kind and for traces written
+    /// before the column existed.
+    pub outcome: Option<Outcome>,
     /// Milliseconds since the Unix epoch. Display only, never for ordering.
     pub wall_time: i64,
 }
@@ -121,10 +165,12 @@ pub enum Error {
     },
     #[error("trace database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
-    #[error("event_id {0} does not fit the trace's signed 64-bit column")]
+    #[error("event id {0} does not fit the trace's signed 64-bit column")]
     EventIdRange(u64),
     #[error("trace row {event_id} has unknown event kind {kind:?}")]
     UnknownKind { event_id: i64, kind: String },
+    #[error("trace row {event_id} has unknown outcome {outcome:?}")]
+    UnknownOutcome { event_id: i64, outcome: String },
     #[error(
         "{path} already holds {events} events; resuming a run is not supported, start a new run id"
     )]
@@ -133,9 +179,9 @@ pub enum Error {
     RunInUse { path: PathBuf },
     #[error("payload blob error: {0}")]
     Blob(#[from] BlobError),
-    #[error("event {event_id} arrived with a payload_hash; only the writer may set one")]
+    #[error("event {event_id} arrived with a payload hash; only the writer may set one")]
     PayloadHashSupplied { event_id: u64 },
-    #[error("trace row {event_id} has a {len}-byte payload_hash, not 32 bytes")]
+    #[error("trace row {event_id} has a {len}-byte payload hash, not 32 bytes")]
     BadPayloadHash { event_id: u64, len: usize },
     #[error("trace row {event_id} has both a payload_hash and an inline tool_input")]
     TwoPayloads { event_id: u64 },
@@ -145,23 +191,35 @@ pub enum Error {
 // triggers, so the table is append-only even for a stray connection.
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS events (
-    event_id     INTEGER PRIMARY KEY,
-    agent_id     TEXT NOT NULL,
-    session_id   TEXT NOT NULL,
-    vclock       BLOB NOT NULL,
-    kind         TEXT NOT NULL,
-    tool         TEXT,
-    path         TEXT,
-    payload_hash BLOB,
-    tool_input   TEXT,
-    wall_time    INTEGER NOT NULL,
-    tool_use_id  TEXT
+    event_id           INTEGER PRIMARY KEY,
+    agent_id           TEXT NOT NULL,
+    session_id         TEXT NOT NULL,
+    vclock             BLOB NOT NULL,
+    kind               TEXT NOT NULL,
+    tool               TEXT,
+    path               TEXT,
+    payload_hash       BLOB,
+    tool_input         TEXT,
+    wall_time          INTEGER NOT NULL,
+    tool_use_id        TEXT,
+    before_event_id    INTEGER,
+    outcome            TEXT,
+    input_payload_hash BLOB
 );
 CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events
 BEGIN SELECT RAISE(ABORT, 'trace is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events
 BEGIN SELECT RAISE(ABORT, 'trace is append-only'); END;
 ";
+
+/// Nullable columns added after issue #2, in the order they were added, with their types. A
+/// trace written before one of them reads it as NULL; an empty such trace gets it from a writer.
+const LATER_COLUMNS: [(&str, &str); 4] = [
+    ("tool_use_id", "TEXT"),
+    ("before_event_id", "INTEGER"),
+    ("outcome", "TEXT"),
+    ("input_payload_hash", "BLOB"),
+];
 
 /// The single writer of a run's trace and its payload blobs. Append-only: there is no update or
 /// delete.
@@ -183,7 +241,7 @@ impl TraceWriter {
     /// Refused while another writer holds the run, and refused if the trace already holds events:
     /// the coordinator's clocks and event ids start from zero, so writing on would restamp
     /// history. A refused run gets no `blobs/` directory and no schema change. An empty trace from
-    /// before `tool_use_id` existed gets that column.
+    /// before a later column existed gets that column.
     pub fn create(run_dir: &Path) -> Result<Self, Error> {
         durable_dir::create(run_dir).map_err(|(path, source)| Error::Io { path, source })?;
         let lock_path = run_dir.join(LOCK_FILE);
@@ -220,10 +278,12 @@ impl TraceWriter {
                 events: events as u64,
             });
         }
-        if !has_tool_use_id(&conn)? {
-            // An empty trace created before the column existed. Nothing in it needs the column,
-            // so adding it changes no recorded event.
-            conn.execute_batch("ALTER TABLE events ADD COLUMN tool_use_id TEXT")?;
+        for (name, sql_type) in LATER_COLUMNS {
+            if !has_column(&conn, name)? {
+                // An empty trace created before the column existed. Nothing in it needs the
+                // column, so adding it changes no recorded event.
+                conn.execute_batch(&format!("ALTER TABLE events ADD COLUMN {name} {sql_type}"))?;
+            }
         }
         let blobs = BlobStore::open(run_dir)?;
         Ok(Self {
@@ -233,30 +293,31 @@ impl TraceWriter {
         })
     }
 
-    /// Append one event. If it carries a `tool_input`, those exact bytes are first stored and
-    /// flushed as a blob; the row then holds the blob's hash in `payload_hash` and NULL in
-    /// `tool_input`. If storing the blob fails, nothing is inserted. If the INSERT fails, the
-    /// stored blob stays as an orphan that no row names; storing the same bytes again reuses it.
+    /// Append one event. Its `payload` and then its `input_payload`, when present, are first
+    /// stored and flushed as blobs; the row then holds their hashes in `payload_hash` and
+    /// `input_payload_hash`, and NULL in the inline `tool_input` column. If storing a blob fails,
+    /// nothing is inserted. If the INSERT (or the second blob) fails, the blobs already stored
+    /// stay as orphans that no row names; storing the same bytes again reuses them.
     ///
     /// Each call is its own transaction, so a returned `Ok` is durable to SQLite's default
-    /// guarantees. Fails if `event_id` already exists, or if the event already has a
-    /// `payload_hash` (only this writer may set one).
+    /// guarantees. Fails if `event_id` already exists, or if the event already has a payload hash
+    /// (only this writer may set one).
     pub fn append(&mut self, event: &Event) -> Result<(), Error> {
         let id = to_row_id(event.event_id)?;
-        if event.payload_hash.is_some() {
+        let before_event_id = event.before_event_id.map(to_row_id).transpose()?;
+        if event.payload_hash.is_some() || event.input_payload_hash.is_some() {
             return Err(Error::PayloadHashSupplied {
                 event_id: event.event_id,
             });
         }
-        let payload_hash = match &event.tool_input {
-            Some(input) => Some(self.blobs.put(input.as_bytes())?.as_bytes().to_vec()),
-            None => None,
-        };
+        let payload_hash = self.put(event.payload.as_deref())?;
+        let input_payload_hash = self.put(event.input_payload.as_deref())?;
         self.conn.execute(
             "INSERT INTO events
                 (event_id, agent_id, session_id, vclock, kind, tool, path, payload_hash,
-                 tool_input, wall_time, tool_use_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 tool_input, wall_time, tool_use_id, before_event_id, outcome,
+                 input_payload_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, ?11, ?12, ?13)",
             params![
                 id,
                 event.slot,
@@ -266,12 +327,22 @@ impl TraceWriter {
                 event.tool,
                 event.path,
                 payload_hash,
-                Option::<String>::None,
                 event.wall_time,
                 event.tool_use_id,
+                before_event_id,
+                event.outcome.map(Outcome::as_str),
+                input_payload_hash,
             ],
         )?;
         Ok(())
+    }
+
+    /// Store `bytes` as a flushed blob and return its hash for the row.
+    fn put(&self, bytes: Option<&str>) -> Result<Option<Vec<u8>>, Error> {
+        match bytes {
+            Some(bytes) => Ok(Some(self.blobs.put(bytes.as_bytes())?.as_bytes().to_vec())),
+            None => Ok(None),
+        }
     }
 }
 
@@ -279,85 +350,60 @@ fn to_row_id(event_id: u64) -> Result<i64, Error> {
     i64::try_from(event_id).map_err(|_| Error::EventIdRange(event_id))
 }
 
-/// Whether the `events` table has the `tool_use_id` column (traces from before it do not).
-fn has_tool_use_id(conn: &Connection) -> Result<bool, Error> {
-    let mut stmt =
-        conn.prepare("SELECT 1 FROM pragma_table_info('events') WHERE name = 'tool_use_id'")?;
-    Ok(stmt.exists([])?)
+/// Whether the `events` table has the column `name` (traces from before it do not).
+fn has_column(conn: &Connection, name: &str) -> Result<bool, Error> {
+    let mut stmt = conn.prepare("SELECT 1 FROM pragma_table_info('events') WHERE name = ?1")?;
+    Ok(stmt.exists([name])?)
 }
 
-type Row = (
-    i64,
-    String,
-    String,
-    Vec<u8>,
-    String,
-    Option<String>,
-    Option<String>,
-    Option<Vec<u8>>,
-    Option<String>,
-    i64,
-    Option<String>,
-);
-
 /// Read every event in `event_id` order. A minimal reader for tests and tooling; the real query
-/// layer is a later issue. Opens the database read-only: a trace from before `tool_use_id`
-/// existed is read as it is, with `tool_use_id` `None` on every row.
+/// layer is a later issue. Opens the database read-only: a column added after the trace was
+/// written (see the crate docs) is read as `None` on every row, and nothing is written.
 pub fn read_events(db_path: &Path) -> Result<Vec<Event>, Error> {
     let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let tool_use_id = if has_tool_use_id(&conn)? {
-        "tool_use_id"
-    } else {
-        "NULL"
-    };
+    let mut later = Vec::new();
+    for (name, _) in LATER_COLUMNS {
+        later.push(if has_column(&conn, name)? {
+            name
+        } else {
+            "NULL"
+        });
+    }
     let mut stmt = conn.prepare(&format!(
         "SELECT event_id, agent_id, session_id, vclock, kind, tool, path, payload_hash,
-                tool_input, wall_time, {tool_use_id}
-         FROM events ORDER BY event_id"
+                tool_input, wall_time, {}
+         FROM events ORDER BY event_id",
+        later.join(", ")
     ))?;
-    let rows = stmt.query_map([], |row| -> rusqlite::Result<Row> {
-        Ok((
-            row.get(0)?,
-            row.get(1)?,
-            row.get(2)?,
-            row.get(3)?,
-            row.get(4)?,
-            row.get(5)?,
-            row.get(6)?,
-            row.get(7)?,
-            row.get(8)?,
-            row.get(9)?,
-            row.get(10)?,
-        ))
-    })?;
+    let mut rows = stmt.query([])?;
     let mut events = Vec::new();
-    for row in rows {
-        let (
-            id,
-            slot,
-            session_id,
-            vclock,
-            kind,
-            tool,
-            path,
-            payload_hash,
-            tool_input,
-            wall_time,
-            tool_use_id,
-        ) = row?;
+    while let Some(row) = rows.next()? {
+        let id: i64 = row.get(0)?;
+        let kind: String = row.get(4)?;
         let kind = EventKind::parse(&kind).ok_or(Error::UnknownKind { event_id: id, kind })?;
+        let outcome = match row.get::<_, Option<String>>(12)? {
+            Some(text) => Some(Outcome::parse(&text).ok_or(Error::UnknownOutcome {
+                event_id: id,
+                outcome: text,
+            })?),
+            None => None,
+        };
         events.push(Event {
             event_id: id as u64,
-            slot,
-            session_id,
-            vclock,
+            slot: row.get(1)?,
+            session_id: row.get(2)?,
+            vclock: row.get(3)?,
             kind,
-            tool,
-            path,
-            payload_hash,
-            tool_input,
-            tool_use_id,
-            wall_time,
+            tool: row.get(5)?,
+            path: row.get(6)?,
+            payload_hash: row.get(7)?,
+            payload: row.get(8)?,
+            input_payload_hash: row.get(13)?,
+            input_payload: None,
+            tool_use_id: row.get(10)?,
+            before_event_id: row.get::<_, Option<i64>>(11)?.map(|b| b as u64),
+            outcome,
+            wall_time: row.get(9)?,
         });
     }
     Ok(events)
@@ -368,23 +414,32 @@ pub fn read_events(db_path: &Path) -> Result<Vec<Event>, Error> {
 /// (an issue #2 trace), and `None` when it has neither. The blob is rehashed on read, so a
 /// missing or corrupt blob is an error, never wrong bytes. Reading creates nothing in `run_dir`.
 pub fn read_payload(run_dir: &Path, event: &Event) -> Result<Option<Vec<u8>>, Error> {
-    match (&event.payload_hash, &event.tool_input) {
+    match (&event.payload_hash, &event.payload) {
         (Some(_), Some(_)) => Err(Error::TwoPayloads {
             event_id: event.event_id,
         }),
-        (Some(hash), None) => {
-            let hash: [u8; 32] = hash
-                .as_slice()
-                .try_into()
-                .map_err(|_| Error::BadPayloadHash {
-                    event_id: event.event_id,
-                    len: hash.len(),
-                })?;
-            Ok(Some(read_blob(run_dir, &BlobHash::from(hash))?))
-        }
+        (Some(hash), None) => read_named_blob(run_dir, event.event_id, hash).map(Some),
         (None, Some(inline)) => Ok(Some(inline.clone().into_bytes())),
         (None, None) => Ok(None),
     }
+}
+
+/// The exact raw `tool_input` bytes an AfterTool row reported, from the blob named by its
+/// `input_payload_hash`; `None` for a row without one. Checked like [`read_payload`].
+pub fn read_input_payload(run_dir: &Path, event: &Event) -> Result<Option<Vec<u8>>, Error> {
+    event
+        .input_payload_hash
+        .as_ref()
+        .map(|hash| read_named_blob(run_dir, event.event_id, hash))
+        .transpose()
+}
+
+fn read_named_blob(run_dir: &Path, event_id: u64, hash: &[u8]) -> Result<Vec<u8>, Error> {
+    let hash: [u8; 32] = hash.try_into().map_err(|_| Error::BadPayloadHash {
+        event_id,
+        len: hash.len(),
+    })?;
+    Ok(read_blob(run_dir, &BlobHash::from(hash))?)
 }
 
 #[cfg(test)]
@@ -401,8 +456,12 @@ mod tests {
             tool: Some("Edit".into()),
             path: None,
             payload_hash: None,
-            tool_input: None,
+            payload: None,
+            input_payload_hash: None,
+            input_payload: None,
             tool_use_id: Some(format!("toolu_{id}")),
+            before_event_id: None,
+            outcome: None,
             wall_time: 1_700_000_000_123,
         }
     }
@@ -421,21 +480,32 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = TraceWriter::create(tmp.path()).unwrap();
         let raw = r#"{"file_path":"src/lib.rs", "x":1}"#;
+        let response = "null";
         let mut full = event(2, EventKind::AfterTool);
         full.path = Some("src/lib.rs".into());
-        full.tool_input = Some(raw.into());
+        full.payload = Some(response.into());
+        full.input_payload = Some(raw.into());
+        full.before_event_id = Some(1);
+        full.outcome = Some(Outcome::Success);
         w.append(&full).unwrap();
         w.append(&event(1, EventKind::BeforeTool)).unwrap();
 
         let got = read_events(&tmp.path().join(TRACE_FILE)).unwrap();
-        // The row keeps the payload's hash, not the payload.
+        // The row keeps the payloads' hashes, not the payloads.
         let mut stored = full.clone();
-        stored.tool_input = None;
-        stored.payload_hash = Some(BlobHash::of(raw.as_bytes()).as_bytes().to_vec());
+        stored.payload = None;
+        stored.input_payload = None;
+        stored.payload_hash = Some(BlobHash::of(response.as_bytes()).as_bytes().to_vec());
+        stored.input_payload_hash = Some(BlobHash::of(raw.as_bytes()).as_bytes().to_vec());
         assert_eq!(got, vec![event(1, EventKind::BeforeTool), stored]);
         assert_eq!(read_payload(tmp.path(), &got[0]).unwrap(), None);
+        assert_eq!(read_input_payload(tmp.path(), &got[0]).unwrap(), None);
         assert_eq!(
             read_payload(tmp.path(), &got[1]).unwrap().as_deref(),
+            Some(response.as_bytes())
+        );
+        assert_eq!(
+            read_input_payload(tmp.path(), &got[1]).unwrap().as_deref(),
             Some(raw.as_bytes())
         );
     }
@@ -446,6 +516,13 @@ mod tests {
         let mut w = TraceWriter::create(tmp.path()).unwrap();
         let mut forged = event(1, EventKind::BeforeTool);
         forged.payload_hash = Some(vec![7; 32]);
+        let err = w.append(&forged).unwrap_err();
+        assert!(
+            matches!(err, Error::PayloadHashSupplied { event_id: 1 }),
+            "{err}"
+        );
+        let mut forged = event(1, EventKind::AfterTool);
+        forged.input_payload_hash = Some(vec![7; 32]);
         let err = w.append(&forged).unwrap_err();
         assert!(
             matches!(err, Error::PayloadHashSupplied { event_id: 1 }),

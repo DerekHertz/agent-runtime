@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Verification harness for agent-runtime: drives the REAL art-coordinator and art-shim binaries.
 
-    verify.py build                 cargo build --workspace --locked --offline
+    verify.py build                 cargo clean -p <each workspace package>, cargo build --workspace, write the receipt
     verify.py doctor [--save]       read-only readiness check (exit 0 ready, 2 blocked)
-    verify.py drive <feature|all>   run journeys, write evidence + summary.json (exit 0 pass, 1 fail, 2 blocked)
+    verify.py drive <feature|all>   run journeys, write evidence + summary.json (exit 0 pass, 1 fail, 2 blocked);
+                                    PASS also needs the end checks: sources, receipt and binaries as at the start
     verify.py cleanup               stop only what this harness started, remove scratch dirs, keep evidence
     verify.py list                  list feature ids
 
@@ -11,6 +12,9 @@ Python 3 stdlib only. Evidence: <repo>/.claude/reviews/evidence/verify-agent-run
 """
 import argparse, datetime, hashlib, json, os, pathlib, shutil, signal, socket, sqlite3
 import struct, subprocess, sys, tempfile, time, traceback
+
+sys.dont_write_bytecode = True  # importing the journey module must leave no __pycache__ in the skill
+import after_tool  # noqa: E402  the after-tool journey, in its own file (scripts/after_tool.py)
 
 SCRIPT = pathlib.Path(__file__).resolve()
 SKILL = SCRIPT.parents[1]
@@ -224,12 +228,41 @@ def cmd_doctor(args):
     return 0 if all(c["passed"] for c in checks) else 2
 
 
+def workspace_packages():
+    """The root workspace's own package names, from `cargo metadata --no-deps`; (names, error)."""
+    r = sh(["cargo", "metadata", "--no-deps", "--format-version", "1", "--locked", "--offline"], cwd=REPO)
+    if r.returncode != 0:
+        return None, f"cargo metadata exited {r.returncode}: {r.stderr.strip()}"
+    try:
+        meta = json.loads(r.stdout)
+        members = set(meta["workspace_members"])
+        names = sorted(p["name"] for p in meta["packages"] if p["id"] in members)
+    except (ValueError, KeyError, TypeError) as e:
+        return None, f"unreadable cargo metadata: {e}"
+    return (names, None) if names else (None, "cargo metadata lists no workspace members")
+
+
 def cmd_build(args):
-    """cargo build, then record which sources produced which binaries (the receipt doctor checks)."""
+    """Clean the workspace's own packages, cargo build, then record which sources produced which
+    binaries (the receipt doctor checks)."""
     receipt = receipt_path(args)
     receipt.unlink(missing_ok=True)  # a failed or raced build must not leave an older receipt vouching for it
     before = source_manifest()
     env = dict(os.environ, CARGO_TARGET_DIR=str(target_dir(args)))
+    # Cargo decides freshness by mtime, so a source restored with an older mtime than its artifact
+    # (a mutation check, a `cp -p`, a checkout) leaves the stale artifact in place. Cleaning the
+    # workspace's own packages forces them to rebuild from the bytes the receipt hashes; third-party
+    # dependencies stay cached. `cargo clean` has no --workspace, hence one -p per member.
+    names, err = workspace_packages()
+    if names is None:
+        print(f"clean: {err}; no receipt written")
+        return 1
+    print(f"clean: cargo clean -p for the workspace packages {names} in {target_dir(args)}")
+    clean = ["cargo", "clean", "--locked", "--offline"] + [a for n in names for a in ("-p", n)]
+    rc = subprocess.run(clean, cwd=REPO, env=env).returncode
+    if rc != 0:
+        print(f"clean: cargo clean exited {rc}; no receipt written")
+        return rc
     rc = subprocess.run(["cargo", "build", "--workspace", "--locked", "--offline"], cwd=REPO, env=env).returncode
     if rc != 0:
         return rc
@@ -240,7 +273,7 @@ def cmd_build(args):
     bins = {name: sha256(p) for name, p in binaries(args).items()}
     receipt.write_text(json.dumps({"built_utc": utc(), "sources_aggregate_sha256": after["aggregate_sha256"],
                                    "source_file_count": after["file_count"], "binaries": bins,
-                                   "target_dir": str(target_dir(args))}, indent=2) + "\n")
+                                   "cleaned_packages": names, "target_dir": str(target_dir(args))}, indent=2) + "\n")
     print(f"build receipt: {receipt}")
     return 0
 
@@ -294,13 +327,14 @@ class Ctx:
         self.commands.append({"label": label, "exit_code": rec["exit_code"], "file": str(f.relative_to(self.dir.parent))})
         return rec
 
-    def shim(self, label, slot, socket_path, stdin, **kw):
+    def shim(self, label, slot, socket_path, stdin, args=(), **kw):
+        """Run art-shim as Claude Code would; `args` is the hook registration's command line."""
         env = {}
         if slot is not None:
             env["AGENT_RUNTIME_SLOT"] = slot
         if socket_path is not None:
             env["AGENT_RUNTIME_SOCKET"] = str(socket_path)
-        return self.run(label, [self.bins["art-shim"]], env=env, stdin=stdin, **kw)
+        return self.run(label, [self.bins["art-shim"], *args], env=env, stdin=stdin, **kw)
 
     def coordinator_argv(self, run_id, slots, runs_dir, sock):
         return [self.bins["art-coordinator"], "--run-id", run_id, "--slots", ",".join(slots),
@@ -349,14 +383,18 @@ class Ctx:
         if db.exists():
             conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
             try:
-                q = "SELECT event_id, agent_id, session_id, vclock, kind, tool, path, payload_hash, tool_input, wall_time, tool_use_id FROM events ORDER BY event_id"
+                q = ("SELECT event_id, agent_id, session_id, vclock, kind, tool, path, payload_hash, tool_input, wall_time, "
+                     "tool_use_id, before_event_id, outcome, input_payload_hash FROM events ORDER BY event_id")
                 for r in conn.execute(q):
                     n = len(r[3]) // 8
                     source, payload = resolve_payload(run_dir, r[7], r[8])
+                    in_source, in_payload = resolve_payload(run_dir, r[13], None)
                     rows.append({"event_id": r[0], "slot": r[1], "session_id": r[2], "vclock": list(struct.unpack(f"<{n}Q", r[3])),
                                  "kind": r[4], "tool": r[5], "path": r[6], "payload_hash": r[7].hex() if r[7] is not None else None,
                                  "tool_input": r[8], "payload_source": source, "payload": payload, "wall_time": r[9],
-                                 "tool_use_id": r[10]})
+                                 "tool_use_id": r[10], "before_event_id": r[11], "outcome": r[12],
+                                 "input_payload_hash": r[13].hex() if r[13] is not None else None,
+                                 "input_payload_source": in_source, "input_payload": in_payload})
             finally:
                 conn.close()
         (self.dir / f"trace-{label}.json").write_text(json.dumps({"db": str(db), "rows": rows}, indent=2) + "\n")
@@ -636,6 +674,9 @@ def j_call_identity(c):
         edit = c.fixtures["pre_tool_use_edit"]
         fx = json.loads(edit)
         sess, tid = fx["session_id"], fx["tool_use_id"]
+        retry = with_ids(edit, tool_use_id="toolu_verify_notool")
+        assert retry.count('"tool_name":"Edit"') == 1
+        no_tool = retry.replace('"tool_name":"Edit"', '"tool_name":""')
         co = c.start("a", s, "r1", SLOTS)
         run = s / "runs/r1"
 
@@ -649,7 +690,8 @@ def j_call_identity(c):
         steps = [("repeat-before", "slot-1", edit, "already recorded"),
                  ("session-on-other-slot", "slot-2", with_ids(edit, tool_use_id="toolu_verify_moved"), "bound to slot"),
                  ("empty-tool-use-id", "slot-1", with_ids(edit, tool_use_id=""), "empty tool_use_id"),
-                 ("empty-session-id", "slot-1", with_ids(edit, session_id="", tool_use_id="toolu_verify_nosess"), "empty session_id")]
+                 ("empty-session-id", "slot-1", with_ids(edit, session_id="", tool_use_id="toolu_verify_nosess"), "empty session_id"),
+                 ("empty-tool-name", "slot-1", no_tool, "no tool")]
         for label, slot, stdin, why in steps:
             code, d, reason = decision(label, slot, stdin)
             c.check(f"{label}: exit 0 with a deny decision whose reason says {why!r}", (code, d) == (0, "deny") and why in reason,
@@ -660,7 +702,8 @@ def j_call_identity(c):
         calls = [("restart-same-slot", "slot-1", with_ids(edit, session_id="sess-verify-restart", tool_use_id="toolu_verify_r1")),
                  ("same-id-other-session", "slot-2", with_ids(edit, session_id="sess-verify-other")),
                  ("overlap-1", "slot-1", with_ids(edit, tool_use_id="toolu_verify_o1")),
-                 ("overlap-2", "slot-1", with_ids(edit, tool_use_id="toolu_verify_o2"))]
+                 ("overlap-2", "slot-1", with_ids(edit, tool_use_id="toolu_verify_o2")),
+                 ("empty-tool-retry", "slot-1", retry)]
         for label, slot, stdin in calls:
             code, d, reason = decision(label, slot, stdin)
             c.check(f"{label}: allowed", (code, d) == (0, "allow"), exit_code=code, decision=d, reason=reason)
@@ -668,9 +711,10 @@ def j_call_identity(c):
         got = [(x["event_id"], x["slot"], x["session_id"], x["tool_use_id"], x["vclock"]) for x in rows]
         want = [(1, "slot-1", sess, tid, [1, 0]), (2, "slot-1", "sess-verify-restart", "toolu_verify_r1", [2, 0]),
                 (3, "slot-2", "sess-verify-other", tid, [0, 1]), (4, "slot-1", sess, "toolu_verify_o1", [3, 0]),
-                (5, "slot-1", sess, "toolu_verify_o2", [4, 0])]
+                (5, "slot-1", sess, "toolu_verify_o2", [4, 0]), (6, "slot-1", sess, "toolu_verify_notool", [5, 0])]
         c.check("rows: a restarted session continues slot-1's clock, an equal id in another session is its own call, "
-                "and overlapping calls keep their own events", got == want, rows=got)
+                "overlapping calls keep their own events, and the empty-tool call's id was left free for its retry",
+                got == want, rows=got)
         c.check("every row's blob is the fixture's raw tool_input",
                 all((x["payload_source"], x["payload"]) == ("blob", raw_tool_input(edit)) for x in rows))
         co.stop()
@@ -687,6 +731,7 @@ FEATURES = {
     "slot-clocks": j_clocks,
     "hook-input": j_hook_input,
     "call-identity": j_call_identity,
+    "after-tool": lambda c: after_tool.journey(c, sys.modules[__name__]),
 }
 
 
@@ -731,6 +776,26 @@ def quiet_cleanup():
         return cmd_cleanup()
 
 
+def end_checks(args, manifest, start_receipt):
+    """The run's end guard: what doctor vouched for at the start still holds after the journeys.
+
+    These compare two endpoints only. An edit made and undone (or a binary swapped and swapped
+    back) between them is invisible here, so the sources and target dir must still stay frozen
+    while a drive runs.
+    """
+    out = []
+    add = lambda name, ok, detail="": out.append({"name": name, "passed": bool(ok), "detail": detail})
+    now = source_manifest()
+    was, cur = manifest["files"], now["files"]
+    changed = sorted(k for k in set(was) | set(cur) if was.get(k) != cur.get(k))
+    add("end: sources unchanged since the run started", now["aggregate_sha256"] == manifest["aggregate_sha256"],
+        f"start {manifest['aggregate_sha256']}, end {now['aggregate_sha256']}; changed {changed}")
+    add("end: build receipt is the one doctor checked at the start", load_receipt(args) == start_receipt,
+        str(receipt_path(args)))
+    out.extend(dict(c, name=f"end: {c['name']}") for c in receipt_checks(args))
+    return out
+
+
 def cmd_drive(args):
     names = list(FEATURES) if args.feature == "all" else [args.feature]
     bad = [n for n in names if n not in FEATURES]
@@ -767,12 +832,20 @@ def cmd_drive(args):
         summary["features"][name] = {"passed": bool(c.checks) and all(k["passed"] for k in c.checks), "started_utc": started,
                                      "finished_utc": utc(), "checks": c.checks, "commands": c.commands}
         quiet_cleanup()
-    ok = all(f["passed"] for f in summary["features"].values())
-    summary["sources"]["unchanged_during_run"] = source_manifest()["aggregate_sha256"] == manifest["aggregate_sha256"]
-    summary.update(status="PASS" if ok else "FAIL", finished_utc=utc())
+    end = end_checks(args, manifest, summary["build_receipt"])
+    summary["end_checks"] = end
+    summary["sources"]["unchanged_during_run"] = end[0]["passed"]
+    reasons = [f"feature {n} failed" for n, f in summary["features"].items() if not f["passed"]]
+    reasons += [f"{c['name']} failed: {c['detail']}" for c in end if not c["passed"]]
+    ok = not reasons
+    summary.update(status="PASS" if ok else "FAIL", status_reasons=reasons, finished_utc=utc())
     (ev / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    for c in end:
+        print(f"[{'ok' if c['passed'] else 'FAIL'}] {c['name']}: {c['detail']}")
     for n, f in summary["features"].items():
         print(f"{'PASS' if f['passed'] else 'FAIL'} {n} ({sum(k['passed'] for k in f['checks'])}/{len(f['checks'])} checks)")
+    for r in reasons:
+        print(f"FAIL reason: {r}")
     print(f"{summary['status']}: evidence in {ev}")
     return 0 if ok else 1
 

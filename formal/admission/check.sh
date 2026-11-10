@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# One command that checks the admission path of the coordinator: TLC on formal/admission/Admission.tla
-# plus the real-code tests. Run it from anywhere; it works on the checkout it lives in.
+# One command that checks the recording path of the coordinator (BeforeTool admissions and AfterTool
+# completion reports): TLC on formal/admission/Admission.tla plus the real-code tests. Run it from anywhere; it works on the checkout it lives in.
 #
 #   formal/admission/check.sh            model + code
 #   formal/admission/check.sh --model    TLC only
@@ -82,7 +82,7 @@ tlc() { # name config
   local name=$1 cfg=$2
   rm -rf "$OUT/states-$name"
   ( cd "$OUT/model" && "$JAVA_BIN" -XX:+UseParallelGC -Djava.io.tmpdir="$OUT/tmp" \
-      -cp "$JAR" tlc2.TLC -nowarning -workers 1 -metadir "$OUT/states-$name" \
+      -cp "$JAR" tlc2.TLC -nowarning -workers auto -metadir "$OUT/states-$name" \
       -config "$cfg" Admission.tla ) >"$OUT/$name.log" 2>&1
 }
 
@@ -126,13 +126,21 @@ if [ "$want_model" = 1 ]; then
     fail=1
     row "FAIL  identity witness: no identity refusal is reachable, so rule (g) would be vacuous (log $OUT/identity-witness.log)"
   fi
-  tlc retry-identity-witness AdmissionRetryIdentityWitness.cfg
-  if grep -q "Invariant FailedIdentityNotRetried is violated" "$OUT/retry-identity-witness.log"; then
-    row "PASS  retry identity witness: the model reaches 'a failed call retried with its session and tool_use_id and admitted' ($(path_of "$OUT/retry-identity-witness.log"))"
-  else
-    fail=1
-    row "FAIL  retry identity witness: the retry of a failed call's identity is not reachable (log $OUT/retry-identity-witness.log)"
-  fi
+  # The witnesses: each names a case a rule is about, and TLC must reach it.
+  for spec in retry-identity:AdmissionRetryIdentityWitness:FailedIdentityNotRetried \
+              completion-retry:AdmissionCompletionRetryWitness:CompletionRetryNotReached \
+              repeat:AdmissionRepeatWitness:RepeatedCompletionNotReached \
+              orphan-completion:AdmissionOrphanCompletionWitness:OrphanCompletionNotReached \
+              out-of-order:AdmissionOutOfOrderWitness:OutOfOrderPairingNotReached; do
+    name=${spec%%:*}; rest=${spec#*:}; cfg=${rest%%:*}; inv=${rest#*:}
+    tlc "$name-witness" "$cfg.cfg"
+    if grep -q "Invariant $inv is violated" "$OUT/$name-witness.log"; then
+      row "PASS  $name witness: the model reaches the case $inv rules out ($(path_of "$OUT/$name-witness.log"))"
+    else
+      fail=1
+      row "FAIL  $name witness: the case $inv rules out is not reachable, so its rule would be vacuous (log $OUT/$name-witness.log)"
+    fi
+  done
 
   # Each broken variant must be caught, by the rule named here (mutants/<variant>.cfg checks
   # that one rule alone, so every rule is seen to fail at least once).
@@ -140,7 +148,10 @@ if [ "$want_model" = 1 ]; then
               ignore_append_error:AllowIsDurable no_tick:StampsIncrease \
               no_mutex:CallsDoNotCollide record_unknown_slot:DenyRecordsNothing \
               row_before_blob:RowsNameStoredBlobs no_binding_check:SessionStaysOnSlot \
-              no_repeat_check:CallRecordedOnce identity_before_append:CoreMatchesTrace; do
+              no_repeat_check:CallRecordedOnce identity_before_append:CoreMatchesTrace \
+              input_blob_after_row:RowsNameStoredBlobs no_tool_check:CallKeepsItsTool \
+              guess_before:AfterPairsWithItsBefore last_completion:CoreMatchesTrace \
+              completion_before_append:CoreMatchesTrace; do
     m=${pair%%:*}; rule=${pair##*:}
     tlc "mutant-$m" "mutants/$m.cfg"
     if grep -q "Invariant $rule is violated" "$OUT/mutant-$m.log"; then
@@ -165,24 +176,32 @@ if [ "$want_model" = 1 ]; then
 fi
 
 # ---------------------------------------------------------------------------------------------
-# 3. Real code: the existing unit test for the failed append, and the admission tests
+# 3. Real code: the adapter's failed-append unit tests, the admission and the AfterTool tests
 # ---------------------------------------------------------------------------------------------
 if [ "$want_code" = 1 ]; then
   mkdir -p "$OUT"
   cd "$ROOT" || exit 2
-  if cargo test -p coordinator --lib failed_append_keeps_the_old_state --offline --locked >"$OUT/cargo-lib.log" 2>&1 \
-     && grep -q "test adapter::tests::failed_append_keeps_the_old_state ... ok" "$OUT/cargo-lib.log"; then
-    row "PASS  code: adapter::tests::failed_append_keeps_the_old_state"
+  if cargo test -p coordinator --lib adapter::tests::failed_ --offline --locked >"$OUT/cargo-lib.log" 2>&1 \
+     && grep -q "test adapter::tests::failed_append_keeps_the_old_state ... ok" "$OUT/cargo-lib.log" \
+     && grep -q "test adapter::tests::failed_after_tool_append_completes_nothing ... ok" "$OUT/cargo-lib.log"; then
+    row "PASS  code: adapter::tests::failed_append_keeps_the_old_state, failed_after_tool_append_completes_nothing"
   else
     fail=1
-    row "FAIL  code: adapter::tests::failed_append_keeps_the_old_state (log $OUT/cargo-lib.log)"
+    row "FAIL  code: adapter::tests::failed_* (log $OUT/cargo-lib.log)"
   fi
   if cargo test -p coordinator --test admission_durability --offline --locked >"$OUT/cargo-admission.log" 2>&1 \
-     && grep -q "test result: ok. 7 passed" "$OUT/cargo-admission.log"; then
-    row "PASS  code: tests/admission_durability.rs (7 tests)"
+     && grep -q "test result: ok. 8 passed" "$OUT/cargo-admission.log"; then
+    row "PASS  code: tests/admission_durability.rs (8 tests)"
   else
     fail=1
     row "FAIL  code: tests/admission_durability.rs: $(grep -E '^test .* FAILED|^error' "$OUT/cargo-admission.log" | head -3 | tr '\n' ' ')(log $OUT/cargo-admission.log)"
+  fi
+  if cargo test -p coordinator --test after_tool_durability --offline --locked >"$OUT/cargo-after-tool.log" 2>&1 \
+     && grep -q "test result: ok. 6 passed" "$OUT/cargo-after-tool.log"; then
+    row "PASS  code: tests/after_tool_durability.rs (6 tests)"
+  else
+    fail=1
+    row "FAIL  code: tests/after_tool_durability.rs: $(grep -E '^test .* FAILED|^error' "$OUT/cargo-after-tool.log" | head -3 | tr '\n' ' ')(log $OUT/cargo-after-tool.log)"
   fi
 fi
 

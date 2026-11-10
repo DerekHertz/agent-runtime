@@ -1,7 +1,7 @@
 // View for the statechart of Admission.tla: one region for each call, one for the trace.
 // The words are the shim's and the operator's, not the code's.
 
-export const title = "Two calls of before_tool, each trace write may fail";
+export const title = "Two BeforeTool or AfterTool calls, each blob or trace write may fail";
 
 const CALLS = { k1: "Call 1", k2: "Call 2" };
 
@@ -13,11 +13,9 @@ const callState = (v, k) => {
       return "Holds the lock, deciding on a copy";
     case "early_commit":
     case "stepped":
-      return "Decided, about to store the tool input";
-    case "blob_stored":
-      return "Tool input stored, about to write the event";
-    case "row_written":
-      return "Event written before its tool input (broken variant)";
+      return "Decided, about to store the payload";
+    case "writing":
+      return "Storing the payload blobs, then writing the event";
     case "to_commit":
       return "Event written, state not yet advanced";
     case "committed":
@@ -27,11 +25,18 @@ const callState = (v, k) => {
     case "failed":
       return "Store or write failed, lock freed, state unchanged";
     case "done":
-      return v.reply[k] === "Err"
-        ? "Shim got an error"
-        : v.reply[k] === "Deny"
-          ? "Shim got a Deny, nothing recorded"
-          : "Shim got an Allow";
+      switch (v.reply[k]) {
+        case "Err":
+          return "Shim got an error";
+        case "Deny":
+          return "Shim got a Deny, nothing recorded";
+        case "Refused":
+          return "Report refused, nothing recorded";
+        case "Ack":
+          return "Report recorded";
+        default:
+          return "Shim got an Allow";
+      }
     default:
       return v.pc[k];
   }
@@ -42,7 +47,7 @@ export const state = (v) => {
   return {
     [CALLS.k1]: callState(v, "k1"),
     [CALLS.k2]: callState(v, "k2"),
-    Trace: rows === 0 ? "No events" : rows === 1 ? "One event" : "Two events",
+    Trace: rows === 0 ? "No events" : `${rows} event${rows === 1 ? "" : "s"}`,
   };
 };
 
@@ -52,14 +57,16 @@ export const step = (action) => {
       return "the call takes the lock";
     case "Step":
       return "the core decides on a copy of the state";
+    case "StartWrites":
+      return "the append begins";
     case "BlobOk":
-      return "the tool input is stored and flushed";
+      return "a payload blob is stored and flushed";
     case "BlobFails":
-      return "storing the tool input fails";
+      return "storing a payload blob fails";
     case "AppendOk":
       return "the event is written to the trace";
     case "AppendFails":
-      return "the write to the trace fails, leaving the stored tool input unused";
+      return "the write to the trace fails, leaving the stored blobs unused";
     case "AppendIdClash":
       return "the write clashes with the other call's event";
     case "NoRecord":

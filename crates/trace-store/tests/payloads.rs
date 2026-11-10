@@ -10,7 +10,7 @@ use trace_store::{
     TRACE_FILE,
 };
 
-fn event(id: u64, tool_input: Option<&str>) -> Event {
+fn event(id: u64, payload: Option<&str>) -> Event {
     Event {
         event_id: id,
         slot: "slot-1".into(),
@@ -20,8 +20,12 @@ fn event(id: u64, tool_input: Option<&str>) -> Event {
         tool: Some("Edit".into()),
         path: None,
         payload_hash: None,
-        tool_input: tool_input.map(str::to_owned),
+        payload: payload.map(str::to_owned),
+        input_payload_hash: None,
+        input_payload: None,
         tool_use_id: Some(format!("toolu_{id}")),
+        before_event_id: None,
+        outcome: None,
         wall_time: 1_700_000_000_000,
     }
 }
@@ -49,7 +53,7 @@ fn a_new_row_names_its_blob_by_hash_and_the_blob_holds_the_exact_bytes() {
     assert_eq!(rows.len(), 1);
     let hash = BlobHash::of(RAW.as_bytes());
     assert_eq!(rows[0].payload_hash.as_deref(), Some(&hash.as_bytes()[..]));
-    assert_eq!(rows[0].tool_input, None, "no inline body in a new row");
+    assert_eq!(rows[0].payload, None, "no inline body in a new row");
     // The NULL is in the database itself, not just in the decoded struct.
     let inline: Option<String> = Connection::open(run_dir.join(TRACE_FILE))
         .unwrap()

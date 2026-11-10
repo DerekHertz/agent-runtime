@@ -45,6 +45,7 @@ fn run(st: State, input: Input, now: i64) -> (State, Vec<Event>, Admission) {
                 assert!(admission.is_none(), "exactly one admission per input");
                 admission = Some(a);
             }
+            Output::Ack(ack) => panic!("a BeforeTool is answered with an admission: {ack:?}"),
         }
     }
     (st, events, admission.expect("every input is answered"))
@@ -80,7 +81,7 @@ fn event_carries_slot_session_tool_kind_and_now() {
     assert_eq!(e.payload_hash, None);
     // The raw tool input is recorded byte for byte (SPEC section 7: re-classify offline).
     assert_eq!(
-        e.tool_input.as_deref(),
+        e.payload.as_deref(),
         Some(r#"{"file_path": "/work/src/lib.rs"}"#)
     );
     assert_eq!(e.wall_time, 1_234_567);

@@ -4,11 +4,13 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use runtime_proto::v1::{
     admission::Verdict,
+    after_tool_report::Result as ReportResult,
     coordinator_server::{Coordinator, CoordinatorServer},
-    Admission, BeforeToolRequest,
+    Ack, Admission, AfterToolReport, BeforeToolRequest,
 };
 use serde_json::{json, Value};
 use tokio_stream::wrappers::UnixListenerStream;
@@ -21,8 +23,17 @@ const POST: &str = include_str!("fixtures/post_tool_use_edit.json");
 /// Run the shim with `stdin`. `env` is `(slot, socket)`; `None` leaves that variable unset. The
 /// parent's `AGENT_RUNTIME_*` variables are always cleared first.
 fn run_shim(slot: Option<&str>, socket: Option<&Path>, stdin: &str) -> Output {
+    run_shim_as(&[], slot, socket, stdin)
+}
+
+/// The PostToolUse registration's command line.
+const REPORT: &[&str] = &["--hook-event", "PostToolUse"];
+
+/// [`run_shim`] with the registration's arguments, such as [`REPORT`].
+fn run_shim_as(args: &[&str], slot: Option<&str>, socket: Option<&Path>, stdin: &str) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_art-shim"));
-    cmd.env_remove("AGENT_RUNTIME_SLOT")
+    cmd.args(args)
+        .env_remove("AGENT_RUNTIME_SLOT")
         .env_remove("AGENT_RUNTIME_SOCKET")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -63,6 +74,23 @@ fn assert_fail_closed(out: &Output) {
     );
 }
 
+/// A report that could not be made: nonblocking exit 1, nothing on stdout, a reason on stderr.
+fn assert_report_failed(out: &Output) {
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(out));
+    assert_eq!(stdout(out), "");
+    assert!(
+        stderr(out).starts_with("agent-runtime:"),
+        "stderr: {}",
+        stderr(out)
+    );
+}
+
+fn assert_silent(out: &Output) {
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(out));
+    assert_eq!(stdout(out), "");
+    assert_eq!(stderr(out), "");
+}
+
 /// A new directory for sockets under `$TMPDIR`. macOS limits a Unix socket path to about 104 bytes; the default `$TMPDIR` there is
 /// about 50, so the short prefix and socket names below keep the path in bounds.
 fn socket_dir() -> tempfile::TempDir {
@@ -82,6 +110,9 @@ fn socket_dir() -> tempfile::TempDir {
 struct Fake {
     reply: Admission,
     calls: Arc<Mutex<Vec<BeforeToolRequest>>>,
+    /// `None` acks every report; `Some` refuses it with this status, after a delay.
+    report_error: Option<(tonic::Code, Duration)>,
+    reports: Arc<Mutex<Vec<AfterToolReport>>>,
 }
 
 #[tonic::async_trait]
@@ -93,12 +124,24 @@ impl Coordinator for Fake {
         self.calls.lock().unwrap().push(request.into_inner());
         Ok(Response::new(self.reply.clone()))
     }
+
+    async fn after_tool(&self, request: Request<AfterToolReport>) -> Result<Response<Ack>, Status> {
+        self.reports.lock().unwrap().push(request.into_inner());
+        match self.report_error {
+            None => Ok(Response::new(Ack {})),
+            Some((code, delay)) => {
+                tokio::time::sleep(delay).await;
+                Err(Status::new(code, "refused by the fake coordinator"))
+            }
+        }
+    }
 }
 
 /// A fake coordinator serving on a Unix socket in its own thread. Dropping it stops the server.
 struct FakeCoordinator {
     socket: PathBuf,
     calls: Arc<Mutex<Vec<BeforeToolRequest>>>,
+    reports: Arc<Mutex<Vec<AfterToolReport>>>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
     _dir: tempfile::TempDir,
@@ -106,12 +149,19 @@ struct FakeCoordinator {
 
 impl FakeCoordinator {
     fn start(reply: Admission) -> Self {
+        Self::start_with(reply, None)
+    }
+
+    fn start_with(reply: Admission, report_error: Option<(tonic::Code, Duration)>) -> Self {
         let dir = socket_dir();
         let socket = dir.path().join("c.sock");
         let calls = Arc::new(Mutex::new(Vec::new()));
+        let reports = Arc::new(Mutex::new(Vec::new()));
         let fake = Fake {
             reply,
             calls: calls.clone(),
+            report_error,
+            reports: reports.clone(),
         };
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -145,6 +195,7 @@ impl FakeCoordinator {
         FakeCoordinator {
             socket,
             calls,
+            reports,
             stop: Some(stop),
             thread: Some(thread),
             _dir: dir,
@@ -160,6 +211,10 @@ impl FakeCoordinator {
 
     fn calls(&self) -> Vec<BeforeToolRequest> {
         self.calls.lock().unwrap().clone()
+    }
+
+    fn reports(&self) -> Vec<AfterToolReport> {
+        self.reports.lock().unwrap().clone()
     }
 }
 
@@ -326,12 +381,175 @@ fn malformed_input_fails_closed_without_contacting_the_coordinator() {
 }
 
 #[test]
-fn other_hook_events_are_silent_for_now() {
-    // PostToolUse reporting is a later issue.
+fn the_legacy_registration_lets_other_events_pass_silently() {
+    // Without --hook-event the shim is the issue #2 PreToolUse gate only.
     let fake = FakeCoordinator::allow();
-    let out = run_shim(Some("a"), Some(&fake.socket), POST);
-
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
-    assert_eq!(stdout(&out), "");
+    assert_silent(&run_shim(Some("a"), Some(&fake.socket), POST));
     assert_eq!(fake.calls().len(), 0);
+    assert_eq!(fake.reports().len(), 0);
+}
+
+#[test]
+fn a_registered_pre_tool_use_gate_behaves_like_the_legacy_one() {
+    let fake = FakeCoordinator::allow();
+    let args = &["--hook-event", "PreToolUse"];
+    let out = run_shim_as(args, Some("a"), Some(&fake.socket), EDIT);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(
+        parse(&stdout(&out))["hookSpecificOutput"]["permissionDecision"],
+        "allow"
+    );
+    // A gate registered for PreToolUse fails closed on any other event.
+    assert_fail_closed(&run_shim_as(args, Some("a"), Some(&fake.socket), POST));
+    assert_eq!(fake.calls().len(), 1);
+}
+
+#[test]
+fn a_post_tool_use_report_is_silent_and_carries_the_raw_input_and_response() {
+    let fake = FakeCoordinator::allow();
+    let null_response = POST.replace(
+        r#""tool_response":{"filePath":"/work/src/lib.rs"}"#,
+        r#""tool_response":null"#,
+    );
+    assert_ne!(null_response, POST);
+    for stdin in [POST, null_response.as_str()] {
+        assert_silent(&run_shim_as(REPORT, Some("a"), Some(&fake.socket), stdin));
+    }
+    let reports = fake.reports();
+    assert_eq!(reports.len(), 2);
+    assert_eq!(fake.calls().len(), 0, "a report asks for no admission");
+    let hook = parse(POST);
+    let responses = [r#"{"filePath":"/work/src/lib.rs"}"#, "null"];
+    for (report, response) in reports.iter().zip(responses) {
+        assert_eq!(report.slot, "a");
+        assert_eq!(report.session_id, hook["session_id"]);
+        assert_eq!(report.tool, "Edit");
+        assert_eq!(report.tool_use_id, hook["tool_use_id"]);
+        assert_eq!(
+            report.tool_input_json,
+            r#"{"file_path":"/work/src/lib.rs","old_string":"a","new_string":"b","replace_all":false}"#
+        );
+        match &report.result {
+            Some(ReportResult::Success(s)) => assert_eq!(s.tool_response_json, response),
+            None => panic!("the report has no result"),
+        }
+    }
+}
+
+#[test]
+fn a_refused_report_fails_without_blocking() {
+    let fake = FakeCoordinator::start_with(
+        Admission::default(),
+        Some((tonic::Code::FailedPrecondition, Duration::ZERO)),
+    );
+    let out = run_shim_as(REPORT, Some("a"), Some(&fake.socket), POST);
+    assert_report_failed(&out);
+    assert!(
+        stderr(&out).contains("refused by the fake coordinator"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(fake.reports().len(), 1);
+}
+
+#[test]
+fn report_transport_and_config_failures_exit_1_not_2() {
+    let dir = socket_dir();
+    let missing = dir.path().join("absent.sock");
+    assert_report_failed(&run_shim_as(REPORT, Some("a"), Some(&missing), POST));
+    let dead = dir.path().join("dead.sock");
+    drop(std::os::unix::net::UnixListener::bind(&dead).expect("bind a Unix socket"));
+    assert_report_failed(&run_shim_as(REPORT, Some("a"), Some(&dead), POST));
+    let fake = FakeCoordinator::allow();
+    assert_report_failed(&run_shim_as(REPORT, Some("a"), None, POST));
+    assert_report_failed(&run_shim_as(REPORT, None, Some(&fake.socket), POST));
+    assert_eq!(fake.reports().len(), 0);
+}
+
+#[test]
+fn malformed_or_mismatched_report_input_exits_1_without_contacting_the_coordinator() {
+    let fake = FakeCoordinator::allow();
+    let no_response = POST.replace(r#""tool_response":{"filePath":"/work/src/lib.rs"},"#, "");
+    assert_ne!(no_response, POST);
+    for bad in ["", "not json", "[]", EDIT, no_response.as_str()] {
+        assert_report_failed(&run_shim_as(REPORT, Some("a"), Some(&fake.socket), bad));
+    }
+    assert_eq!(fake.reports().len(), 0);
+    assert_eq!(fake.calls().len(), 0);
+}
+
+#[test]
+fn a_hung_coordinator_ends_the_report_within_its_bound() {
+    let fake = FakeCoordinator::start_with(
+        Admission::default(),
+        Some((tonic::Code::Unavailable, Duration::from_secs(60))),
+    );
+    let started = Instant::now();
+    let out = run_shim_as(REPORT, Some("a"), Some(&fake.socket), POST);
+    let took = started.elapsed();
+    assert_report_failed(&out);
+    assert!(
+        stderr(&out).contains("did not answer within"),
+        "{}",
+        stderr(&out)
+    );
+    // The bound is 10 s; the documented hook timeout is 30 s.
+    assert!(took < Duration::from_secs(20), "{took:?}");
+}
+
+#[test]
+fn outside_a_run_a_report_is_silent_and_never_calls_the_coordinator() {
+    let fake = FakeCoordinator::allow();
+    assert_silent(&run_shim_as(REPORT, None, None, POST));
+    assert_silent(&run_shim_as(REPORT, None, None, "not json"));
+    // Even a command line this build cannot honour stays silent outside a run.
+    assert_silent(&run_shim_as(&["--hook-event", "Bogus"], None, None, POST));
+    assert_eq!(fake.reports().len() + fake.calls().len(), 0);
+}
+
+#[test]
+fn a_bad_command_line_in_a_run_fails_closed_unless_it_names_a_report() {
+    let fake = FakeCoordinator::allow();
+    for args in [
+        &["--hook-event", "Bogus"][..],
+        &["--wat"],
+        &["--hook-event"],
+    ] {
+        assert_fail_closed(&run_shim_as(args, Some("a"), Some(&fake.socket), EDIT));
+    }
+    // A report event a later build handles must still never block.
+    let out = run_shim_as(
+        &["--hook-event", "Stop"],
+        Some("a"),
+        Some(&fake.socket),
+        "{}",
+    );
+    assert_report_failed(&out);
+    assert_eq!(fake.reports().len() + fake.calls().len(), 0);
+}
+
+/// The registered event fixes the exit code even when arguments follow it. The command line is
+/// refused before any contact, so the socket path is never opened and need not exist.
+#[test]
+fn trailing_arguments_keep_the_registered_events_policy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("never-bound.sock");
+    for event in ["PostToolUse", "PostToolUseFailure", "Stop", "SessionEnd"] {
+        let out = run_shim_as(
+            &["--hook-event", event, "extra"],
+            Some("a"),
+            Some(&socket),
+            POST,
+        );
+        assert_report_failed(&out);
+        assert!(stderr(&out).contains("unexpected"), "{}", stderr(&out));
+    }
+    for args in [
+        &["--hook-event", "PreToolUse", "extra"][..],
+        &["--hook-event", "Bogus", "extra"],
+        &["--hook-event=PostToolUse", "extra"],
+    ] {
+        assert_fail_closed(&run_shim_as(args, Some("a"), Some(&socket), EDIT));
+    }
+    assert!(!socket.exists());
 }

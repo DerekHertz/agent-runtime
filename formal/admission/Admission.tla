@@ -1,8 +1,9 @@
 ---------------------------- MODULE Admission ----------------------------
 (***************************************************************************)
-(* The admission path of the coordinator: CoordinatorService::before_tool  *)
-(* in crates/coordinator/src/adapter.rs, which runs core::step and appends *)
-(* the recorded event to the run's trace.                                  *)
+(* The recording path of the coordinator: CoordinatorService::            *)
+(* step_and_record in crates/coordinator/src/adapter.rs, which both RPCs   *)
+(* use. It runs core::step (a BeforeTool admission or an AfterTool         *)
+(* completion report) and appends the recorded event to the run's trace.   *)
 (*                                                                         *)
 (* One TLA+ action is one indivisible step of that function. The mutex     *)
 (* `self.inner` is held from `lock()` until the guard drops when the       *)
@@ -10,17 +11,18 @@
 (* respect to the other call.                                              *)
 (*                                                                         *)
 (*   Lock          let mut inner = self.inner.lock()                       *)
-(*   Step          core::step(inner.state.clone(), BeforeTool(call), now)  *)
-(*                 with Identities::record_before (core/identity.rs)       *)
-(*   BlobOk        inside TraceWriter::append: self.blobs.put(tool_input)  *)
-(*                 returned Ok (the blob is flushed)                       *)
-(*   BlobFails     the same put returned Err: no row is inserted           *)
+(*   Step          core::step(inner.state.clone(), input, now): for a      *)
+(*                 BeforeTool Identities::record_before, for an AfterTool  *)
+(*                 completion::after_tool and Identities::record_after     *)
+(*   BlobOk        inside TraceWriter::append: one self.blobs.put returned *)
+(*                 Ok (the event's payload, or an AfterTool's input)       *)
+(*   BlobFails     that put returned Err: no row is inserted               *)
 (*   AppendOk      the INSERT inside TraceWriter::append returned Ok       *)
-(*   AppendFails   the INSERT returned Err (the blob stays, an orphan)     *)
-(*   NoRecord      the core emitted no Record (unknown slot)               *)
+(*   AppendFails   the INSERT returned Err (stored blobs stay as orphans)  *)
+(*   NoRecord      the core emitted no Record (a refusal)                  *)
 (*   Commit        inner.state = next                                      *)
-(*   Unlock        the guard drops as before_tool returns Ok(admission)    *)
-(*   Reply         Ok(Response::new(to_wire(admission))) reaches the shim  *)
+(*   Unlock        the guard drops as step_and_record returns Ok(answer)   *)
+(*   Reply         the tonic handler answers the shim                      *)
 (*                                                                         *)
 (* See the coverage table in .agents/skills/formal-verify-admission/       *)
 (* SKILL.md for file:function for every action.                            *)
@@ -28,52 +30,100 @@
 EXTENDS Naturals, Sequences, FiniteSets
 
 CONSTANTS
-    Calls,       \* the calls in flight (two): each one a call of before_tool
+    Calls,       \* the calls in flight (two): each one a BeforeTool or an AfterTool
     Payloads,    \* the raw tool inputs a call may carry (calls may share one)
     Slots,       \* the slots of the run
     Sessions,    \* the session_ids a call may carry
     UseIds,      \* the tool_use_ids a call may carry
+    Tools,       \* the tool names a call may carry
+    Kinds,       \* the kinds a call may be: subset of {"B", "A"} (BeforeTool, AfterTool)
     WithGhost,   \* TRUE: a call may name a slot that is not in the run
+    WithSeed,    \* TRUE: the run may start with one BeforeTool already recorded
     Mutation     \* "none", or the name of a deliberately broken variant
 
 Ghost == "ghost-slot"
 AllSlots == IF WithGhost THEN Slots \cup {Ghost} ELSE Slots
 NoSlot == "unbound"
+NoTool == "-"
+NoBlob == "-"
+Keys == Sessions \X UseIds
+\* What the core remembers about one call: its BeforeTool's event id (0: none), its tool
+\* (NoTool: the call is unknown), and its first AfterTool's event id (0: not completed).
+NoCall == [before |-> 0, tool |-> NoTool, done |-> 0]
+
+\* An AfterTool's response blob. Each call carries its own response.
+Resp(k) == "resp-" \o k
 
 VARIABLES
     slotOf,    \* [Calls -> AllSlots]: the slot each call names (never changes)
     payloadOf, \* [Calls -> Payloads]: the raw tool input of each call (never changes)
     sessionOf, \* [Calls -> Sessions]: the session_id of each call (never changes)
     useIdOf,   \* [Calls -> UseIds]: the tool_use_id of each call (never changes)
-    blobs,     \* SUBSET Payloads: the blobs stored and flushed in runs/<id>/blobs/
-    pc,        \* [Calls -> string]: where each call is inside before_tool
+    kindOf,    \* [Calls -> Kinds]: whether the call is a BeforeTool or an AfterTool
+    toolOf,    \* [Calls -> Tools]: the tool each call names (never changes)
+    blobs,     \* the blobs stored and flushed in runs/<id>/blobs/
+    pc,        \* [Calls -> string]: where each call is inside step_and_record
+    wr,        \* [Calls -> Nat]: the next write of a call in "writing" (see Writes)
     holder,    \* SUBSET Calls: who holds the lock on `inner` ({} = free)
     nextId,    \* inner.state.next_event_id: the committed core state
     clk,       \* [Slots -> Nat]: each slot's own clock entry in inner.state
     bound,     \* [Sessions -> Slots \cup {NoSlot}]: session bindings in inner.state
-    seen,      \* SUBSET (Sessions \X UseIds): call identities in inner.state
+    calls,     \* [Keys -> call record]: the recorded calls (Identities.calls) in inner.state
     out,       \* [Calls -> record]: what core::step returned for the call
     trace,     \* Seq(record): the rows of trace.db, in commit order
     reply,     \* [Calls -> string]: what the shim got back
-    injected   \* SUBSET Calls: calls whose append the environment made fail
+    injected   \* SUBSET Calls: calls whose blob or row write the environment made fail
 
-vars == <<slotOf, payloadOf, sessionOf, useIdOf, blobs, pc, holder, nextId, clk, bound, seen,
-          out, trace, reply, injected>>
-\* The parts of the state the identity actions never change, and the per-call constants.
-ids == <<sessionOf, useIdOf>>
+vars == <<slotOf, payloadOf, sessionOf, useIdOf, kindOf, toolOf, blobs, pc, wr, holder, nextId,
+          clk, bound, calls, out, trace, reply, injected>>
+\* The per-call constants.
+given == <<slotOf, payloadOf, sessionOf, useIdOf, kindOf, toolOf>>
+\* The committed core state.
+core == <<nextId, clk, bound, calls>>
 
-NoOut == [has |-> FALSE, id |-> 0, slot |-> "-", stamp |-> 0,
+NoOut == [has |-> FALSE, id |-> 0, slot |-> "-", stamp |-> 0, before |-> 0,
           nid |-> 0, nclk |-> [s \in Slots |-> 0],
-          nbound |-> [x \in Sessions |-> NoSlot], nseen |-> {}, verdict |-> "-"]
+          nbound |-> [x \in Sessions |-> NoSlot], ncalls |-> [c \in Keys |-> NoCall],
+          verdict |-> "-"]
 
 TraceIds == {trace[i].id : i \in DOMAIN trace}
+KeyOf(r) == <<r.session, r.use>>
+
+(* The blob a call's row names as its payload: a BeforeTool's input, an    *)
+(* AfterTool's response.                                                   *)
+PrimaryBlob(k) == IF kindOf[k] = "B" THEN payloadOf[k] ELSE Resp(k)
+
+(* The writes TraceWriter::append makes for a recorded event, in order:    *)
+(* "blob" puts the payload, "input" puts an AfterTool's input, "row" is    *)
+(* the INSERT. Broken variants: "row_before_blob" inserts first;           *)
+(* "input_blob_after_row" puts an AfterTool's input after its row.         *)
+RowFirst == Mutation = "row_before_blob"
+Writes(k) ==
+    IF kindOf[k] = "B"
+    THEN IF RowFirst THEN <<"row", "blob">> ELSE <<"blob", "row">>
+    ELSE IF RowFirst THEN <<"row", "blob", "input">>
+    ELSE IF Mutation = "input_blob_after_row" THEN <<"blob", "row", "input">>
+    ELSE <<"blob", "input", "row">>
+NextWrite(k) == Writes(k)[wr[k]]
 
 (* A call is inside the critical section from the first line after lock()  *)
 (* up to and including `inner.state = next`. Outside it the committed      *)
 (* state and the trace must agree.                                         *)
-InCritical(k) == pc[k] \in {"locked", "stepped", "early_commit", "blob_stored",
-                            "row_written", "to_commit", "committed"}
+InCritical(k) == pc[k] \in {"locked", "stepped", "early_commit", "writing", "to_commit",
+                            "committed"}
 Quiet == \A k \in Calls : ~InCritical(k)
+
+(* The optional row already in the trace: a BeforeTool of (x1, u1) on the  *)
+(* first slot, recorded before either call. It lets two calls show a       *)
+(* completion, its failure and retry, or a repeated completion.            *)
+SeedSlot == CHOOSE s \in Slots : TRUE
+SeedSession == CHOOSE x \in Sessions : TRUE
+SeedUse == CHOOSE u \in UseIds : TRUE
+SeedTool == CHOOSE t \in Tools : TRUE
+SeedPayload == CHOOSE p \in Payloads : TRUE
+SeedRow == [id |-> 1, slot |-> SeedSlot, stamp |-> 1, call |-> "seed", kind |-> "B",
+            blob |-> SeedPayload, inBlob |-> NoBlob, session |-> SeedSession, use |-> SeedUse,
+            tool |-> SeedTool, before |-> 0]
 
 -----------------------------------------------------------------------------
 Init ==
@@ -81,17 +131,30 @@ Init ==
     /\ payloadOf \in [Calls -> Payloads]
     /\ sessionOf \in [Calls -> Sessions]
     /\ useIdOf \in [Calls -> UseIds]
-    /\ blobs = {}                        \* a new run's blobs/ is empty
+    /\ kindOf \in [Calls -> Kinds]
+    /\ toolOf \in [Calls -> Tools]
     /\ pc = [k \in Calls |-> "new"]
+    /\ wr = [k \in Calls |-> 0]
     /\ holder = {}
-    /\ nextId = 1                        \* State::new: event ids start at 1
-    /\ clk = [s \in Slots |-> 0]         \* every slot's clock starts at zero
-    /\ bound = [x \in Sessions |-> NoSlot] \* no session is bound yet
-    /\ seen = {}                         \* no call is recorded yet
     /\ out = [k \in Calls |-> NoOut]
-    /\ trace = <<>>
     /\ reply = [k \in Calls |-> "-"]
     /\ injected = {}
+    /\ \E seeded \in IF WithSeed THEN BOOLEAN ELSE {FALSE} :
+         IF seeded
+         THEN /\ trace = <<SeedRow>>
+              /\ blobs = {SeedPayload}
+              /\ nextId = 2
+              /\ clk = [s \in Slots |-> IF s = SeedSlot THEN 1 ELSE 0]
+              /\ bound = [x \in Sessions |-> IF x = SeedSession THEN SeedSlot ELSE NoSlot]
+              /\ calls = [c \in Keys |-> IF c = <<SeedSession, SeedUse>>
+                                         THEN [before |-> 1, tool |-> SeedTool, done |-> 0]
+                                         ELSE NoCall]
+         ELSE /\ trace = <<>>                 \* a new run: empty trace and blobs/
+              /\ blobs = {}
+              /\ nextId = 1                   \* State::new: event ids start at 1
+              /\ clk = [s \in Slots |-> 0]    \* every slot's clock starts at zero
+              /\ bound = [x \in Sessions |-> NoSlot]
+              /\ calls = [c \in Keys |-> NoCall]
 
 (* `self.inner.lock()`: blocks while the other call holds it. *)
 Lock(k) ==
@@ -99,170 +162,204 @@ Lock(k) ==
     /\ (Mutation = "no_mutex" \/ holder = {})
     /\ holder' = holder \cup {k}
     /\ pc' = [pc EXCEPT ![k] = "locked"]
-    /\ UNCHANGED <<slotOf, payloadOf, ids, blobs, nextId, clk, bound, seen, out, trace, reply, injected>>
+    /\ UNCHANGED <<given, blobs, wr, core, out, trace, reply, injected>>
 
 (* `core::step(inner.state.clone(), ...)`: works on a copy. An unknown slot *)
-(* gets a Deny. A known slot then has its call's identity checked by        *)
-(* Identities::record_before: a session bound to another slot, or a         *)
-(* (session, tool_use_id) already recorded, gets a Deny too. Every Deny has *)
-(* no Record and the state unchanged. Otherwise the call gets the next      *)
-(* event id, its slot's clock ticked (clock rule 1), its session bound and  *)
-(* its identity recorded, all in the copy. Empty ids are refused by the     *)
-(* same check and are not modeled separately.                               *)
-(* Broken variants: "no_tick" skips the tick; "record_unknown_slot" records *)
-(* an event for the unknown slot as well; "no_binding_check" and            *)
-(* "no_repeat_check" skip one identity check; "identity_before_append"      *)
-(* writes the binding and the identity into inner.state at once, before    *)
-(* the append.                                                              *)
+(* is refused. A known slot then has its call's identity checked: a        *)
+(* session bound to another slot is refused; a BeforeTool whose            *)
+(* (session, tool_use_id) is already recorded is refused                   *)
+(* (Identities::record_before); an AfterTool of a recorded call that names *)
+(* another tool is refused (Identities::record_after). A refusal has no    *)
+(* Record and the state unchanged. Otherwise the call gets the next event  *)
+(* id, its slot's clock ticked (clock rule 1), its session bound, and in   *)
+(* the copy: a BeforeTool records the call; an AfterTool pairs with the    *)
+(* call's BeforeTool by identity alone (0 for an orphan, which is then     *)
+(* recorded with no BeforeTool) and becomes the call's completion unless   *)
+(* it already has one. Empty ids are refused by the same checks and are    *)
+(* not modeled separately. An empty tool is refused before any identity    *)
+(* check (core::before_tool and completion::after_tool), so no call is     *)
+(* recorded with a tool outside Tools, which never holds NoTool.           *)
+(* Broken variants: "no_tick" skips the tick; "record_unknown_slot"        *)
+(* records an event for the unknown slot as well; "no_binding_check",      *)
+(* "no_repeat_check" and "no_tool_check" skip one identity check;          *)
+(* "guess_before" pairs an orphan with the latest event; "last_completion" *)
+(* lets a repeated report replace the completion; "identity_before_append" *)
+(* writes the new binding and calls into inner.state at once, before the   *)
+(* append; "completion_before_append" does so for an AfterTool's calls     *)
+(* only.                                                                   *)
 Step(k) ==
     /\ pc[k] = "locked"
     /\ LET s == slotOf[k]
            x == sessionOf[k]
            c == <<x, useIdOf[k]>>
+           isAfter == kindOf[k] = "A"
            known == s \in Slots
+           recorded == calls[c].tool # NoTool
            sameSlot == bound[x] \in {NoSlot, s} \/ Mutation = "no_binding_check"
-           fresh == c \notin seen \/ Mutation = "no_repeat_check"
-           admitted == known /\ sameSlot /\ fresh
+           fits == IF isAfter
+                   THEN ~recorded \/ calls[c].tool = toolOf[k] \/ Mutation = "no_tool_check"
+                   ELSE ~recorded \/ Mutation = "no_repeat_check"
+           admitted == known /\ sameSlot /\ fits
            stampOf == IF ~known THEN 0
                       ELSE IF Mutation = "no_tick" THEN clk[s] ELSE clk[s] + 1
+           pairs == IF recorded THEN calls[c].before
+                    ELSE IF Mutation = "guess_before" THEN nextId - 1 ELSE 0
+           doneOf == IF calls[c].done = 0 \/ Mutation = "last_completion"
+                     THEN nextId ELSE calls[c].done
+           newCall == IF isAfter
+                      THEN [before |-> pairs, tool |-> toolOf[k], done |-> doneOf]
+                      ELSE [before |-> nextId, tool |-> toolOf[k], done |-> 0]
            nbound == IF admitted THEN [bound EXCEPT ![x] = s] ELSE bound
-           nseen == IF admitted THEN seen \cup {c} ELSE seen
+           ncalls == IF admitted THEN [calls EXCEPT ![c] = newCall] ELSE calls
+           yes == IF isAfter THEN "Ack" ELSE "Allow"
+           no == IF isAfter THEN "Refused" ELSE "Deny"
        IN /\ out' = [out EXCEPT ![k] =
                  IF admitted \/ (~known /\ Mutation = "record_unknown_slot")
                  THEN [has |-> TRUE, id |-> nextId, slot |-> s, stamp |-> stampOf,
+                       before |-> IF isAfter THEN pairs ELSE 0,
                        nid |-> nextId + 1,
                        nclk |-> IF known THEN [clk EXCEPT ![s] = stampOf] ELSE clk,
-                       nbound |-> nbound, nseen |-> nseen,
-                       verdict |-> IF known THEN "Allow" ELSE "Deny"]
-                 ELSE [has |-> FALSE, id |-> 0, slot |-> s, stamp |-> 0,
-                       nid |-> nextId, nclk |-> clk, nbound |-> bound, nseen |-> seen,
-                       verdict |-> "Deny"]]
+                       nbound |-> nbound, ncalls |-> ncalls,
+                       verdict |-> IF known THEN yes ELSE no]
+                 ELSE [has |-> FALSE, id |-> 0, slot |-> s, stamp |-> 0, before |-> 0,
+                       nid |-> nextId, nclk |-> clk, nbound |-> bound, ncalls |-> calls,
+                       verdict |-> no]]
           /\ IF Mutation = "identity_before_append"
-             THEN bound' = nbound /\ seen' = nseen
-             ELSE UNCHANGED <<bound, seen>>
+                \/ (Mutation = "completion_before_append" /\ isAfter)
+             THEN /\ calls' = ncalls
+                  /\ bound' = IF Mutation = "identity_before_append" THEN nbound ELSE bound
+             ELSE UNCHANGED <<bound, calls>>
     /\ pc' = [pc EXCEPT ![k] =
                 IF Mutation = "commit_before_append" THEN "early_commit"
                 ELSE "stepped"]
-    /\ UNCHANGED <<slotOf, payloadOf, ids, blobs, holder, nextId, clk, trace, reply, injected>>
+    /\ UNCHANGED <<given, blobs, wr, holder, nextId, clk, trace, reply, injected>>
 
 (* Only in the broken variant "commit_before_append": `inner.state = next`  *)
-(* moved above the append loop.                                             *)
+(* moved above the append.                                                  *)
 EarlyCommit(k) ==
     /\ pc[k] = "early_commit"
     /\ Mutation = "commit_before_append"
     /\ nextId' = out[k].nid
     /\ clk' = out[k].nclk
     /\ bound' = out[k].nbound
-    /\ seen' = out[k].nseen
+    /\ calls' = out[k].ncalls
     /\ pc' = [pc EXCEPT ![k] = "stepped"]
-    /\ UNCHANGED <<slotOf, payloadOf, ids, blobs, holder, out, trace, reply, injected>>
+    /\ UNCHANGED <<given, blobs, wr, holder, out, trace, reply, injected>>
 
 AfterAppend == IF Mutation = "commit_before_append" THEN "committed"
                ELSE "to_commit"
 
-(* TraceWriter::append stores the payload blob, then inserts the row. The   *)
-(* broken variant "row_before_blob" swaps the two.                          *)
-RowFirst == Mutation = "row_before_blob"
-BlobFrom == IF RowFirst THEN "row_written" ELSE "stepped"
-AfterBlob == IF RowFirst THEN AfterAppend ELSE "blob_stored"
-RowFrom == IF RowFirst THEN "stepped" ELSE "blob_stored"
-AfterRow == IF RowFirst THEN "row_written" ELSE AfterAppend
-
-(* `self.blobs.put(tool_input)` returned Ok: the blob is in blobs/ and      *)
-(* flushed. Equal payloads share one blob (a set).                          *)
-BlobOk(k) ==
-    /\ pc[k] = BlobFrom
+(* `inner.trace.append(&event)` begins: the event's writes, in order. *)
+StartWrites(k) ==
+    /\ pc[k] = "stepped"
     /\ out[k].has
-    /\ blobs' = blobs \cup {payloadOf[k]}
-    /\ pc' = [pc EXCEPT ![k] = AfterBlob]
-    /\ UNCHANGED <<slotOf, payloadOf, ids, holder, nextId, clk, bound, seen, out, trace, reply, injected>>
+    /\ pc' = [pc EXCEPT ![k] = "writing"]
+    /\ wr' = [wr EXCEPT ![k] = 1]
+    /\ UNCHANGED <<given, blobs, holder, core, out, trace, reply, injected>>
 
-(* The put failed (a full disk, a read-only blobs/; the test makes blobs/   *)
-(* read-only). No blob counts as stored and no row is inserted; `?` returns *)
-(* Err, the guard drops, the state stays. Under "ignore_append_error" the   *)
-(* error is dropped like any other append error.                            *)
-BlobFails(k) ==
-    /\ pc[k] = BlobFrom
-    /\ out[k].has
+(* Move to the next write, or leave append once the last one is done. *)
+Advance(k) ==
+    IF wr[k] = Len(Writes(k))
+    THEN /\ pc' = [pc EXCEPT ![k] = AfterAppend]
+         /\ UNCHANGED wr
+    ELSE /\ wr' = [wr EXCEPT ![k] = wr[k] + 1]
+         /\ UNCHANGED pc
+
+(* A write failed for a reason outside the coordinator. Baseline: `?`      *)
+(* returns Err, the guard drops, the state stays. Broken variant           *)
+(* "ignore_append_error": the error is dropped and the call carries on.    *)
+Fail(k) ==
     /\ injected' = injected \cup {k}
     /\ IF Mutation = "ignore_append_error"
-       THEN /\ pc' = [pc EXCEPT ![k] = AfterBlob]
+       THEN /\ Advance(k)
             /\ UNCHANGED holder
        ELSE /\ pc' = [pc EXCEPT ![k] = "failed"]
             /\ holder' = holder \ {k}
-    /\ UNCHANGED <<slotOf, payloadOf, ids, blobs, nextId, clk, bound, seen, out, trace, reply>>
+            /\ UNCHANGED wr
 
-(* The INSERT returned Ok: one row, durable, naming the call's blob. The id *)
-(* is the primary key, so a row with that id already there makes it fail.   *)
+(* One `self.blobs.put` returned Ok: the blob is in blobs/ and flushed.     *)
+(* Equal contents share one blob (a set).                                   *)
+BlobOk(k) ==
+    /\ pc[k] = "writing"
+    /\ NextWrite(k) \in {"blob", "input"}
+    /\ blobs' = blobs \cup {IF NextWrite(k) = "blob" THEN PrimaryBlob(k) ELSE payloadOf[k]}
+    /\ Advance(k)
+    /\ UNCHANGED <<given, holder, core, out, trace, reply, injected>>
+
+(* The put failed (a full disk, a read-only blobs/; the tests make blobs/   *)
+(* read-only). No blob counts as stored and no row is inserted.             *)
+BlobFails(k) ==
+    /\ pc[k] = "writing"
+    /\ NextWrite(k) \in {"blob", "input"}
+    /\ Fail(k)
+    /\ UNCHANGED <<given, blobs, core, out, trace, reply>>
+
+(* The INSERT returned Ok: one row, durable, naming the call's blobs. The   *)
+(* id is the primary key, so a row with that id already there fails it.     *)
 AppendOk(k) ==
-    /\ pc[k] = RowFrom
-    /\ out[k].has
+    /\ pc[k] = "writing"
+    /\ NextWrite(k) = "row"
     /\ out[k].id \notin TraceIds
     /\ trace' = Append(trace, [id |-> out[k].id, slot |-> out[k].slot,
-                               stamp |-> out[k].stamp, call |-> k,
-                               blob |-> payloadOf[k],
-                               session |-> sessionOf[k], use |-> useIdOf[k]])
-    /\ pc' = [pc EXCEPT ![k] = AfterRow]
-    /\ UNCHANGED <<slotOf, payloadOf, ids, blobs, holder, nextId, clk, bound, seen, out, reply, injected>>
+                               stamp |-> out[k].stamp, call |-> k, kind |-> kindOf[k],
+                               blob |-> PrimaryBlob(k),
+                               inBlob |-> IF kindOf[k] = "A" THEN payloadOf[k] ELSE NoBlob,
+                               session |-> sessionOf[k], use |-> useIdOf[k],
+                               tool |-> toolOf[k], before |-> out[k].before])
+    /\ Advance(k)
+    /\ UNCHANGED <<given, blobs, holder, core, out, reply, injected>>
 
-(* The INSERT fails for a reason outside the coordinator (the test plants a *)
-(* conflicting row; a disk error would do the same). No row is written; a   *)
-(* blob already stored stays as an orphan that no row names.                *)
-(* Baseline: `?` returns Err and the guard drops, the state stays.          *)
-(* Broken variant "ignore_append_error": the error is dropped and the call  *)
-(* carries on to commit and Allow.                                          *)
+(* The INSERT fails for a reason outside the coordinator (the tests plant a *)
+(* conflicting row). No row is written; blobs already stored stay as        *)
+(* orphans that no row names.                                               *)
 AppendFails(k) ==
-    /\ pc[k] = RowFrom
-    /\ out[k].has
-    /\ injected' = injected \cup {k}
-    /\ IF Mutation = "ignore_append_error"
-       THEN /\ pc' = [pc EXCEPT ![k] = AfterRow]
-            /\ UNCHANGED holder
-       ELSE /\ pc' = [pc EXCEPT ![k] = "failed"]
-            /\ holder' = holder \ {k}
-    /\ UNCHANGED <<slotOf, payloadOf, ids, blobs, nextId, clk, bound, seen, out, trace, reply>>
+    /\ pc[k] = "writing"
+    /\ NextWrite(k) = "row"
+    /\ Fail(k)
+    /\ UNCHANGED <<given, blobs, core, out, trace, reply>>
 
 (* The id is already a row: only possible when the two calls are not        *)
 (* serialized (Mutation = "no_mutex"). The primary key refuses the row.     *)
 AppendIdClash(k) ==
-    /\ pc[k] = RowFrom
-    /\ out[k].has
+    /\ pc[k] = "writing"
+    /\ NextWrite(k) = "row"
     /\ out[k].id \in TraceIds
     /\ pc' = [pc EXCEPT ![k] = "failed"]
     /\ holder' = holder \ {k}
-    /\ UNCHANGED <<slotOf, payloadOf, ids, blobs, nextId, clk, bound, seen, out, trace, reply, injected>>
+    /\ UNCHANGED <<given, blobs, wr, core, out, trace, reply, injected>>
 
-(* The core emitted only an Admit: nothing to append. *)
+(* The core emitted only an answer: nothing to append. *)
 NoRecord(k) ==
     /\ pc[k] = "stepped"
     /\ ~out[k].has
     /\ pc' = [pc EXCEPT ![k] = AfterAppend]
-    /\ UNCHANGED <<slotOf, payloadOf, ids, blobs, holder, nextId, clk, bound, seen, out, trace, reply, injected>>
+    /\ UNCHANGED <<given, blobs, wr, holder, core, out, trace, reply, injected>>
 
-(* `inner.state = next`, after every output was performed. *)
+(* `inner.state = next`, after the append. *)
 Commit(k) ==
     /\ pc[k] = "to_commit"
     /\ nextId' = out[k].nid
     /\ clk' = out[k].nclk
     /\ bound' = out[k].nbound
-    /\ seen' = out[k].nseen
+    /\ calls' = out[k].ncalls
     /\ pc' = [pc EXCEPT ![k] = "committed"]
-    /\ UNCHANGED <<slotOf, payloadOf, ids, blobs, holder, out, trace, reply, injected>>
+    /\ UNCHANGED <<given, blobs, wr, holder, out, trace, reply, injected>>
 
-(* The function returns Ok(admission): the guard drops, the lock is free. *)
+(* The function returns Ok(answer): the guard drops, the lock is free. *)
 Unlock(k) ==
     /\ pc[k] = "committed"
     /\ holder' = holder \ {k}
     /\ pc' = [pc EXCEPT ![k] = "returned"]
-    /\ UNCHANGED <<slotOf, payloadOf, ids, blobs, nextId, clk, bound, seen, out, trace, reply, injected>>
+    /\ UNCHANGED <<given, blobs, wr, core, out, trace, reply, injected>>
 
-(* The tonic handler answers the shim; an Err becomes Status::internal.     *)
+(* The tonic handler answers the shim; an Err becomes Status::internal, a   *)
+(* refused report Status::failed_precondition.                              *)
 Reply(k) ==
     /\ pc[k] \in {"returned", "failed"}
     /\ reply' = [reply EXCEPT ![k] =
                    IF pc[k] = "failed" THEN "Err" ELSE out[k].verdict]
     /\ pc' = [pc EXCEPT ![k] = "done"]
-    /\ UNCHANGED <<slotOf, payloadOf, ids, blobs, holder, nextId, clk, bound, seen, out, trace, injected>>
+    /\ UNCHANGED <<given, blobs, wr, holder, core, out, trace, injected>>
 
 (* End state: both calls answered. Nothing changes; named so TLC does not   *)
 (* report the end as a deadlock.                                            *)
@@ -274,6 +371,7 @@ Next ==
     \/ \E k \in Calls : Lock(k)
     \/ \E k \in Calls : Step(k)
     \/ \E k \in Calls : EarlyCommit(k)
+    \/ \E k \in Calls : StartWrites(k)
     \/ \E k \in Calls : BlobOk(k)
     \/ \E k \in Calls : BlobFails(k)
     \/ \E k \in Calls : AppendOk(k)
@@ -293,44 +391,59 @@ Spec == Init /\ [][Next]_vars
 TypeOK ==
     /\ slotOf \in [Calls -> AllSlots]
     /\ payloadOf \in [Calls -> Payloads]
-    /\ blobs \subseteq Payloads
+    /\ kindOf \in [Calls -> Kinds]
+    /\ toolOf \in [Calls -> Tools]
     /\ holder \subseteq Calls
     /\ nextId \in Nat
     /\ clk \in [Slots -> Nat]
     /\ sessionOf \in [Calls -> Sessions]
     /\ useIdOf \in [Calls -> UseIds]
     /\ bound \in [Sessions -> Slots \cup {NoSlot}]
-    /\ seen \subseteq Sessions \X UseIds
-    /\ reply \in [Calls -> {"-", "Allow", "Deny", "Err"}]
+    /\ calls \in [Keys -> [before : Nat, tool : Tools \cup {NoTool}, done : Nat]]
+    /\ reply \in [Calls -> {"-", "Allow", "Deny", "Ack", "Refused", "Err"}]
     /\ injected \subseteq Calls
 
-(* (a) Every Allow the shim got has its BeforeTool event in the trace.      *)
+(* (a) Every Allow or Ack the shim got has its event in the trace.          *)
 AllowIsDurable ==
     \A k \in Calls :
-        reply[k] = "Allow" => \E i \in DOMAIN trace : trace[i].call = k
+        reply[k] \in {"Allow", "Ack"} => \E i \in DOMAIN trace : trace[i].call = k
 
-(* A Deny of an unknown slot records nothing, and nothing in the trace      *)
-(* names a slot outside the run.                                            *)
+(* A Deny or a refused report records nothing.                              *)
 DenyRecordsNothing ==
     \A k \in Calls :
-        reply[k] = "Deny" => \A i \in DOMAIN trace : trace[i].call # k
+        reply[k] \in {"Deny", "Refused"} => \A i \in DOMAIN trace : trace[i].call # k
 
 (* (b) The ids in the trace, in commit order, are 1, 2, 3, ...: unique,     *)
 (* strictly increasing, none skipped.                                       *)
 IdsConsecutive ==
     \A i \in DOMAIN trace : trace[i].id = i
 
+(* What the trace says the core must remember about the call c: the id of  *)
+(* its BeforeTool row, the tool of its first row, the id of its first      *)
+(* AfterTool row (0 for none), or NoCall when no row names it.             *)
+RowsOf(c) == {i \in DOMAIN trace : KeyOf(trace[i]) = c}
+FirstOf(S) == CHOOSE i \in S : \A j \in S : i <= j
+CallFromTrace(c) ==
+    LET rows == RowsOf(c)
+        befores == {i \in rows : trace[i].kind = "B"}
+        afters == {i \in rows : trace[i].kind = "A"}
+    IN IF rows = {} THEN NoCall
+       ELSE [before |-> IF befores = {} THEN 0 ELSE trace[FirstOf(befores)].id,
+             tool |-> trace[FirstOf(rows)].tool,
+             done |-> IF afters = {} THEN 0 ELSE trace[FirstOf(afters)].id]
+
 (* (c) Outside the critical section the committed core state is exactly     *)
-(* what the trace holds: a failed append left next_event_id, the slot's     *)
-(* clock, the session bindings and the recorded call identities where they  *)
-(* were, so a retry reuses the same id and stamp and is not refused as a    *)
-(* repeat of itself.                                                        *)
+(* what the trace holds: a failed write left next_event_id, the slot's      *)
+(* clock, the session bindings, the recorded calls and their completions    *)
+(* where they were, so a retry reuses the same id and stamp, still pairs,   *)
+(* and is not refused as a repeat of itself; and the first completion of a  *)
+(* call stays its completion.                                               *)
 CoreMatchesTrace ==
     Quiet =>
         /\ nextId = Len(trace) + 1
         /\ \A s \in Slots :
              clk[s] = Cardinality({i \in DOMAIN trace : trace[i].slot = s})
-        /\ seen = {<<trace[i].session, trace[i].use>> : i \in DOMAIN trace}
+        /\ \A c \in Keys : calls[c] = CallFromTrace(c)
         /\ \A x \in Sessions :
              IF \E i \in DOMAIN trace : trace[i].session = x
              THEN \E i \in DOMAIN trace : trace[i].session = x /\ bound[x] = trace[i].slot
@@ -341,14 +454,16 @@ StampsIncrease ==
     \A i, j \in DOMAIN trace :
         (i < j /\ trace[i].slot = trace[j].slot) => trace[i].stamp < trace[j].stamp
 
-(* (f) Every row names a blob that is stored and flushed: the blob is put   *)
-(* before its row, so no failure leaves a row without its blob. A blob that *)
-(* no row names (an orphan after a failed INSERT) is allowed.               *)
+(* (f) Every row names blobs that are stored and flushed: its payload, and  *)
+(* an AfterTool's input. Blobs are put before their row, so no failure      *)
+(* leaves a row without its blobs. Orphan blobs are allowed.                *)
 RowsNameStoredBlobs ==
-    \A i \in DOMAIN trace : trace[i].blob \in blobs
+    \A i \in DOMAIN trace :
+        /\ trace[i].blob \in blobs
+        /\ trace[i].kind = "A" => trace[i].inBlob \in blobs
 
 (* (e) What the mutex buys: two calls never make each other fail. A call    *)
-(* gets an Err only when its own append failed for an outside reason.       *)
+(* gets an Err only when one of its own writes failed for an outside reason.*)
 CallsDoNotCollide ==
     \A k \in Calls : reply[k] = "Err" => k \in injected
 
@@ -358,50 +473,101 @@ SessionStaysOnSlot ==
     \A i, j \in DOMAIN trace :
         trace[i].session = trace[j].session => trace[i].slot = trace[j].slot
 
-(* (g) A call identity (session, tool_use_id) is recorded at most once.     *)
+(* (g) A call has at most one BeforeTool row, and none after a row of its   *)
+(* own (a late BeforeTool for an orphan completion is a repeat).            *)
 CallRecordedOnce ==
     \A i, j \in DOMAIN trace :
-        (i # j) => <<trace[i].session, trace[i].use>> # <<trace[j].session, trace[j].use>>
+        (i < j /\ KeyOf(trace[i]) = KeyOf(trace[j])) => trace[j].kind # "B"
+
+(* (h) Every row of a call names the call's tool.                           *)
+CallKeepsItsTool ==
+    \A i, j \in DOMAIN trace :
+        KeyOf(trace[i]) = KeyOf(trace[j]) => trace[i].tool = trace[j].tool
+
+(* (h) An AfterTool row names its own call's BeforeTool row when there is   *)
+(* one, by identity alone, and no row (0) when there is none: never a guess.*)
+AfterPairsWithItsBefore ==
+    \A i \in DOMAIN trace :
+        trace[i].kind = "A" =>
+            LET bs == {j \in DOMAIN trace : trace[j].kind = "B"
+                                          /\ KeyOf(trace[j]) = KeyOf(trace[i])}
+            IN IF bs = {} THEN trace[i].before = 0
+               ELSE \E j \in bs : j < i /\ trace[i].before = trace[j].id
 
 -----------------------------------------------------------------------------
-(* A witness, expected to be VIOLATED: the retry after a failed append      *)
-(* reuses the failed call's id and stamp. Its violation shows the model     *)
-(* reaches the case rule (c) is about, so a pass is not vacuous.            *)
+(* Witnesses, each expected to be VIOLATED: their violation shows the       *)
+(* model reaches the case a rule is about, so a pass is not vacuous.        *)
+
+(* The retry after a failed write reuses the failed call's id and stamp.    *)
 RetryReusesIdAndStamp ==
     \E k1, k2 \in Calls :
         /\ k1 # k2
         /\ reply[k1] = "Err"
-        /\ reply[k2] = "Allow"
+        /\ reply[k2] \in {"Allow", "Ack"}
         /\ \E i \in DOMAIN trace :
              /\ trace[i].call = k2
              /\ trace[i].id = out[k1].id
              /\ trace[i].stamp = out[k1].stamp
 WitnessNotReached == ~RetryReusesIdAndStamp
 
-(* A second witness, expected to be VIOLATED: a call stored its blob, its   *)
-(* INSERT failed, and no row names that blob, which rule (f) allows. Its    *)
-(* violation shows the model reaches the orphan case, so (f) is not proved  *)
-(* only because blobs never outlive a failure.                              *)
+(* A call stored its payload blob, a later write failed, and no row names   *)
+(* that blob, which rule (f) allows.                                        *)
 OrphanBlobReached ==
     \E k \in Calls :
         /\ reply[k] = "Err"
-        /\ payloadOf[k] \in blobs
-        /\ \A i \in DOMAIN trace : trace[i].blob # payloadOf[k]
+        /\ PrimaryBlob(k) \in blobs
+        /\ \A i \in DOMAIN trace : trace[i].blob # PrimaryBlob(k)
 OrphanNotReached == ~OrphanBlobReached
 
-(* Two identity witnesses, each expected to be VIOLATED. The first: a call  *)
-(* of a known slot was refused for its identity (a repeat, or its session   *)
-(* bound to the other slot), so rule (g) is not vacuous. The second: a call *)
-(* whose write failed was retried with the same session and tool_use_id    *)
-(* and admitted, so the identity part of (c) is reached.                    *)
-IdentityRefusalReached == \E k \in Calls : reply[k] = "Deny" /\ slotOf[k] \in Slots
+(* A known slot's call refused for its identity or its tool.                *)
+IdentityRefusalReached ==
+    \E k \in Calls : reply[k] \in {"Deny", "Refused"} /\ slotOf[k] \in Slots
 IdentityRefusalNotReached == ~IdentityRefusalReached
+
+(* A call whose write failed, retried with the same session and             *)
+(* tool_use_id and recorded.                                                *)
 FailedIdentityRetried ==
     \E k1, k2 \in Calls :
         /\ k1 # k2
         /\ reply[k1] = "Err"
-        /\ reply[k2] = "Allow"
+        /\ reply[k2] \in {"Allow", "Ack"}
         /\ <<sessionOf[k1], useIdOf[k1]>> = <<sessionOf[k2], useIdOf[k2]>>
 FailedIdentityNotRetried == ~FailedIdentityRetried
+
+(* A completion report failed, and its retry was recorded with the failed   *)
+(* report's id and still paired with the call's BeforeTool.                 *)
+FailedCompletionRetriedAndPaired ==
+    \E k1, k2 \in Calls :
+        /\ k1 # k2
+        /\ kindOf[k1] = "A" /\ kindOf[k2] = "A"
+        /\ reply[k1] = "Err" /\ reply[k2] = "Ack"
+        /\ <<sessionOf[k1], useIdOf[k1]>> = <<sessionOf[k2], useIdOf[k2]>>
+        /\ \E i \in DOMAIN trace :
+             trace[i].call = k2 /\ trace[i].id = out[k1].id /\ trace[i].before # 0
+CompletionRetryNotReached == ~FailedCompletionRetriedAndPaired
+
+(* Two AfterTool rows of one call name the same BeforeTool.                 *)
+RepeatedCompletionReached ==
+    \E i, j \in DOMAIN trace :
+        /\ i < j
+        /\ trace[i].kind = "A" /\ trace[j].kind = "A"
+        /\ KeyOf(trace[i]) = KeyOf(trace[j])
+        /\ trace[i].before # 0 /\ trace[i].before = trace[j].before
+RepeatedCompletionNotReached == ~RepeatedCompletionReached
+
+(* An AfterTool row with no BeforeTool (an orphan), recorded after another  *)
+(* call's event, so a guess would have had something to guess.              *)
+OrphanCompletionReached ==
+    \E i \in DOMAIN trace : trace[i].kind = "A" /\ trace[i].before = 0 /\ i > 1
+OrphanCompletionNotReached == ~OrphanCompletionReached
+
+(* An AfterTool pairs with a BeforeTool that is not the latest event before *)
+(* it: overlapping calls completed out of order.                            *)
+OutOfOrderPairingReached ==
+    \E i, j \in DOMAIN trace :
+        /\ j < i
+        /\ trace[i].kind = "A" /\ trace[j].kind = "B"
+        /\ trace[i].before # 0 /\ trace[j].id > trace[i].before
+OutOfOrderPairingNotReached == ~OutOfOrderPairingReached
 
 =============================================================================

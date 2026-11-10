@@ -4,7 +4,7 @@ Inside a run the shim passes events it does not gate through silently and blocks
 
 ## Sub-features
 
-- `input-post-ignored` ignores a PostToolUse event: exit 0, no output, no row.
+- `input-post-ignored` ignores a PostToolUse event sent to the legacy no-argument registration: exit 0, no output, no row.
 - `input-malformed-blocks` exits 2 for non-JSON, empty stdin and a JSON array.
 - `input-missing-field-blocks` exits 2 for a PreToolUse without `session_id`, `tool_name`, `tool_input` or `tool_use_id`.
 - `input-no-pollution` leaves the trace empty and the coordinator usable.
@@ -28,5 +28,5 @@ Preconditions:
 
 ## Gotchas
 
-- PostToolUse, PostToolUseFailure, Stop and SessionEnd are intentionally ignored in this slice (reporting arrives later); when AfterTool is implemented the PostToolUse expectation changes to a recorded event and this journey must be updated deliberately.
+- This journey runs `art-shim` with no arguments, the issue #2 PreToolUse registration, which still ignores every other event. PostToolUse is reported only by the `--hook-event PostToolUse` registration; see [AfterTool reports](./after-tool.md). Its malformed input exits 1, not 2.
 - Only the PostToolUse fixture exists; the other ignored events are covered by the shim's unit tests.
