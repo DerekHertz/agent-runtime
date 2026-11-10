@@ -18,6 +18,7 @@ pub fn run(args: &[String]) -> Result<String> {
         .with_context(|| format!("could not load the run in {run_dir}"))?;
     match (question.as_str(), rest) {
         ("concurrent-writes", []) => Ok(concurrent_writes(&run)),
+        ("denies", []) => Ok(denies(&run)),
         ("happens-before", [a, b]) => Ok(line(run.happens_before(id(a)?, id(b)?)?)),
         ("concurrent", [a, b]) => Ok(line(run.concurrent(id(a)?, id(b)?)?)),
         ("knew", [slot, event, at]) => Ok(line(run.knew(slot, id(event)?, id(at)?)?)),
@@ -53,5 +54,22 @@ fn concurrent_writes(run: &Run) -> String {
         let _ = writeln!(out, "{}\t{a} ({})\t{b} ({})", pair.path, slot(a), slot(b));
     }
     let _ = writeln!(out, "{} concurrent write pairs", pairs.len());
+    out
+}
+
+/// One line per Deny, `event (slot)<TAB>path<TAB>reason`, then the count.
+fn denies(run: &Run) -> String {
+    let mut out = String::new();
+    let mut count = 0;
+    for deny in run.denies() {
+        let e = &deny.event;
+        let (path, reason) = (
+            e.path.as_deref().unwrap_or("?"),
+            deny.deny_reason.as_deref().unwrap_or("?"),
+        );
+        let _ = writeln!(out, "{} ({})\t{path}\t{reason}", e.event_id, e.slot);
+        count += 1;
+    }
+    let _ = writeln!(out, "{count} denies");
     out
 }

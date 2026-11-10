@@ -10,11 +10,13 @@ mod run;
 
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: art run <run-file> [--run-id <id>] [--runs-dir <dir, default \"runs\">]
+const USAGE: &str =
+    "usage: art run <run-file> [--run-id <id>] [--runs-dir <dir, default \"runs\">] [--leases]
        art query <run-dir> <question> [arguments]
 
 questions:
   concurrent-writes              every pair of concurrent writes to one path by two slots
+  denies                         every write refused because another slot held the lease
   happens-before <a> <b>         whether event a happens-before event b
   concurrent <a> <b>             whether neither event happens-before the other
   knew <slot> <event> <at>       whether the slot knew of event when it recorded its event at

@@ -56,6 +56,9 @@ pub const LOCK_FILE: &str = "trace.lock";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {
     BeforeTool,
+    /// A write refused because another slot holds the file's lease. Recorded in place of the
+    /// call's BeforeTool, since the tool never runs.
+    Deny,
     AfterTool,
     Stop,
     SessionEnd,
@@ -72,6 +75,7 @@ impl EventKind {
     pub fn as_str(self) -> &'static str {
         match self {
             EventKind::BeforeTool => "BeforeTool",
+            EventKind::Deny => "Deny",
             EventKind::AfterTool => "AfterTool",
             EventKind::Stop => "Stop",
             EventKind::SessionEnd => "SessionEnd",
@@ -87,6 +91,7 @@ impl EventKind {
     pub fn parse(text: &str) -> Option<Self> {
         Some(match text {
             "BeforeTool" => EventKind::BeforeTool,
+            "Deny" => EventKind::Deny,
             "AfterTool" => EventKind::AfterTool,
             "Stop" => EventKind::Stop,
             "SessionEnd" => EventKind::SessionEnd,

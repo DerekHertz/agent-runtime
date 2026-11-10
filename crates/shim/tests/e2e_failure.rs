@@ -106,6 +106,7 @@ async fn failed_and_interrupted_calls_reach_the_trace_with_their_raw_error_and_f
         run_dir: run_dir.clone(),
         socket: socket.clone(),
         slots: vec!["slot-1".into(), "slot-2".into()],
+        leases: false,
     })
     .expect("bind coordinator");
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();

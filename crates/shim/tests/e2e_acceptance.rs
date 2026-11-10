@@ -154,6 +154,7 @@ async fn every_issue_3_hook_event_reaches_the_trace() {
         run_dir: run_dir.clone(),
         socket: socket.clone(),
         slots: vec!["slot-1".into(), "slot-2".into()],
+        leases: false,
     })
     .expect("bind coordinator");
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();

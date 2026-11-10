@@ -6,12 +6,13 @@
 //! when it is empty or bound to another slot. It names no call, so it changes no recorded call,
 //! completion or binding: after a SessionEnd a late completion still pairs with its BeforeTool,
 //! and the session still cannot move to another slot. A new session on the same slot continues
-//! the slot's clock. Nothing is released (leases do not exist yet; a release will be its own
-//! event). Every accepted report ticks its slot's clock once and records one event; nothing
-//! merges.
+//! the slot's clock. A report moves its session to `Stopped` or `Ended` and releases every lease
+//! its slot holds; the Stop or SessionEnd event is the record of that release. Every accepted
+//! report ticks its slot's clock once and records one event; nothing merges.
 
 use trace_store::{Event, Stamp};
 
+use super::identity::SessionPhase;
 use super::{Ack, Output, State};
 
 /// Which lifecycle hook a report is.
@@ -49,11 +50,19 @@ pub(super) fn lifecycle(mut state: State, report: Lifecycle, now: i64) -> (State
     if report.fields_json.is_empty() {
         return refused(state, "the report has no lifecycle fields");
     }
+    let phase = match report.kind {
+        LifecycleKind::Stop => SessionPhase::Stopped,
+        LifecycleKind::SessionEnd => SessionPhase::Ended,
+    };
     if let Err(refusal) = state
         .identities
-        .record_lifecycle(&report.slot, &report.session_id)
+        .record_lifecycle(&report.slot, &report.session_id, phase)
     {
         return refused(state, refusal.to_string());
+    }
+    // The slot's turn or session is over, so it lets go of every file it was writing.
+    if let Some(leases) = &mut state.leases {
+        leases.release_all(&report.slot);
     }
     // Clock rule 1 only: a lifecycle report is an event of its slot, and no knowledge channel.
     let stamp = state

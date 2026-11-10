@@ -83,3 +83,38 @@ fn a_bad_question_or_run_exits_2_with_usage() {
     assert_eq!(code, 2);
     assert!(stderr.contains("could not load the run"), "{stderr}");
 }
+
+#[test]
+fn denies_lists_each_refused_write_with_its_reason_and_it_is_not_a_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut w = TraceWriter::create(tmp.path()).unwrap();
+    w.append(&edit(1, "slot-1", &[1, 0], "/work/src/lib.rs"))
+        .unwrap();
+    let stamp = Stamp {
+        event_id: 2,
+        slot: "slot-2".into(),
+        session_id: "sess-slot-2".into(),
+        vclock: Clock::from_entries(vec![0, 1]).to_bytes(),
+        wall_time: 0,
+    };
+    let deny = Event::deny(
+        stamp,
+        "Edit".into(),
+        "t2".into(),
+        "/work/src/lib.rs".into(),
+        "{}".into(),
+        "leased by slot-1",
+    );
+    w.append(&deny).unwrap();
+    drop(w);
+    let run = |args: &[&str]| {
+        let (code, stdout, stderr) = art(tmp.path(), args);
+        assert_eq!((code, stderr.as_str()), (0, ""), "{args:?}");
+        stdout
+    };
+    assert_eq!(
+        run(&["denies"]),
+        "2 (slot-2)\t/work/src/lib.rs\tleased by slot-1\n1 denies\n"
+    );
+    assert_eq!(run(&["concurrent-writes"]), "0 concurrent write pairs\n");
+}

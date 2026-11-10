@@ -54,6 +54,7 @@ async fn before_tool_is_allowed_stamped_and_appended_to_the_trace() {
             run_dir: run_dir.clone(),
             socket: socket.clone(),
             slots: vec!["slot-1".into(), "slot-2".into()],
+            leases: false,
         },
         async {
             let _ = stopped.await;

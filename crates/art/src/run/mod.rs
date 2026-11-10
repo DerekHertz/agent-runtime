@@ -26,14 +26,20 @@ use session::{Launch, Session};
 /// Directories of the target that are build output or history, not source.
 const NOT_COPIED: [&str; 2] = ["target", ".git"];
 
-/// `art run <run-file> [--run-id <id>] [--runs-dir <dir>]`; `args` starts at the run file.
+/// `art run <run-file> [--run-id <id>] [--runs-dir <dir>] [--leases]`; `args` starts at the run
+/// file. `--leases` is a flag, not a run-file field, so one run file serves both conditions of a
+/// comparison.
 pub fn run(args: &[String]) -> Result<String> {
     let [run_file, flags @ ..] = args else {
         bail!("run needs a run file");
     };
-    let (mut run_id, mut runs_dir) = (None, PathBuf::from("runs"));
+    let (mut run_id, mut runs_dir, mut leases) = (None, PathBuf::from("runs"), false);
     let mut flags = flags.iter();
     while let Some(flag) = flags.next() {
+        if flag == "--leases" {
+            leases = true;
+            continue;
+        }
         let value = flags
             .next()
             .with_context(|| format!("{flag} needs a value"))?;
@@ -51,10 +57,10 @@ pub fn run(args: &[String]) -> Result<String> {
         ),
     };
     let file = RunFile::read(Path::new(run_file))?;
-    start_run(&file, &std::path::absolute(runs_dir)?, &run_id)
+    start_run(&file, &std::path::absolute(runs_dir)?, &run_id, leases)
 }
 
-fn start_run(file: &RunFile, runs_dir: &Path, run_id: &str) -> Result<String> {
+fn start_run(file: &RunFile, runs_dir: &Path, run_id: &str, leases: bool) -> Result<String> {
     let run_dir = runs_dir.join(run_id);
     if run_dir.exists() {
         bail!(
@@ -92,6 +98,7 @@ fn start_run(file: &RunFile, runs_dir: &Path, run_id: &str) -> Result<String> {
         run_id,
         &file.slot_names(),
         socket,
+        leases,
         &run_dir.join("coordinator.log"),
     )?;
     let launch = Launch {
@@ -117,6 +124,7 @@ fn start_run(file: &RunFile, runs_dir: &Path, run_id: &str) -> Result<String> {
 
     let summary = json!({
         "run_id": run_id,
+        "leases": leases,
         "wall_s": started.elapsed().as_secs_f64(),
         "coordinator_clean_shutdown": clean_shutdown,
         "sessions": results,

@@ -6,7 +6,8 @@ use anyhow::{bail, Context};
 use coordinator::adapter::{bind, ServeConfig};
 
 const USAGE: &str = "usage: art-coordinator --run-id <id> --slots slot-1,slot-2 \
-[--runs-dir <dir, default \"runs\">] [--socket <path, default <runs-dir>/<run-id>/coordinator.sock>]";
+[--runs-dir <dir, default \"runs\">] [--socket <path, default <runs-dir>/<run-id>/coordinator.sock>] \
+[--leases: a write takes the file's lease, and another slot's write to it is denied]";
 
 #[derive(Debug, PartialEq, Eq)]
 struct Args {
@@ -14,6 +15,7 @@ struct Args {
     slots: Vec<String>,
     runs_dir: PathBuf,
     socket: Option<PathBuf>,
+    leases: bool,
 }
 
 /// `Ok(None)` means help was requested.
@@ -22,10 +24,15 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> anyhow::Result<Option<A
     let mut slots = None;
     let mut runs_dir = None;
     let mut socket = None;
+    let mut leases = false;
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         if flag == "--help" || flag == "-h" {
             return Ok(None);
+        }
+        if flag == "--leases" {
+            leases = true;
+            continue;
         }
         let mut value = || args.next().with_context(|| format!("{flag} needs a value"));
         match flag.as_str() {
@@ -50,6 +57,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> anyhow::Result<Option<A
         slots,
         runs_dir: runs_dir.unwrap_or_else(|| PathBuf::from("runs")),
         socket,
+        leases,
     }))
 }
 
@@ -84,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
         run_dir,
         socket: socket.clone(),
         slots: args.slots,
+        leases: args.leases,
     })?;
     eprintln!("art-coordinator: listening on {}", socket.display());
     listening.serve(shutdown_signal(term)).await

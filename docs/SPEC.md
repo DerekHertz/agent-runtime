@@ -113,6 +113,8 @@ The coordinator enforces Invalid itself. The model's context can't be cleared, a
 
 Until M3, Deny or Defer is a single setting for the whole run, with Deny as the default. M3 adds choosing it per phase. A Deny reason names the slot holding the lease, that agent's stated intent, and how long it has held the lease.
 
+**As built so far.** A coordinator started with `--leases` takes a file's lease on a slot's first admitted Edit, Write or NotebookEdit of it. Another slot's write to that file is denied and recorded as one `Deny` event in place of the call's BeforeTool: its payload is the reason given to the agent (JSON text of a string), and the raw tool input is its input payload. A lease is released only by its holder's Stop or SessionEnd, and that event is the record of the release; there is no separate Acquire or Release event, so every input still records at most one event. Not built yet: Defer, the time limit, release commands, `art release`, Bash and whole-tree leases, the Invalid standing and reads of a leased file.
+
 **Release.** A lease is released on any of six triggers:
 1. the owning agent's Stop (it finished its turn);
 2. its SessionEnd;
@@ -158,7 +160,7 @@ This is what ties coherence and causality together: reading a file that agent A 
 | event_id     | u64    | monotonic per coordinator                                                              |
 | agent_id     | string | session or loop id                                                                     |
 | vclock       | bytes  | serialized vector, one u64 per agent                                                   |
-| kind         | enum   | BeforeTool, AfterTool, Stop, SessionEnd, Acquire, Release, Invalidate, Barrier, Scatter, Gather. Kinds are additive: Stop and SessionEnd (lifecycle reports, section 3) were added with the hooks that record them; a reader refuses a kind it does not know |
+| kind         | enum   | BeforeTool, Deny, AfterTool, Stop, SessionEnd, Acquire, Release, Invalidate, Barrier, Scatter, Gather. Kinds are additive: Stop and SessionEnd (lifecycle reports, section 3) were added with the hooks that record them; a reader refuses a kind it does not know |
 | tool         | string | Edit, Write, Bash, Read, etc.                                                          |
 | path         | string | file or symbol, if any                                                                 |
 | payload_hash | bytes  | hash of the tool input or output; the full content lives in a blob store keyed by hash. A BeforeTool's payload is its raw tool input, a successful AfterTool's its raw tool response (any JSON value, `null` included), a failed AfterTool's the raw JSON text of the hook's `error` string (`""` for an empty message). A Stop's or SessionEnd's payload is a JSON object holding exactly the lifecycle fields the hook carried, each value its raw JSON text, keys in this order: Stop `stop_hook_active` then `last_assistant_message`, SessionEnd `reason`. A field the hook omitted is absent, never filled in (`{}` when it carried none); other hook fields are not kept. For example `{"stop_hook_active":false,"last_assistant_message":"done"}` |

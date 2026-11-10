@@ -18,6 +18,7 @@ import after_tool  # noqa: E402  the after-tool journey, in its own file (script
 import failed_tool  # noqa: E402  the failed-tool journey (scripts/failed_tool.py)
 import lifecycle  # noqa: E402  the lifecycle journey, Stop and SessionEnd (scripts/lifecycle.py)
 import launcher  # noqa: E402  the launcher journey, art run and art query (scripts/launcher.py)
+import leases  # noqa: E402  the leases journey, a denied write and its release (scripts/leases.py)
 
 SCRIPT = pathlib.Path(__file__).resolve()
 SKILL = SCRIPT.parents[1]
@@ -346,12 +347,12 @@ class Ctx:
         return [self.bins["art-coordinator"], "--run-id", run_id, "--slots", ",".join(slots),
                 "--runs-dir", runs_dir, "--socket", sock]
 
-    def start(self, tag, scratch, run_id, slots):
+    def start(self, tag, scratch, run_id, slots, extra=()):
         """Start a real art-coordinator in scratch; return it once its socket accepts a connection."""
         sock, runs_dir = scratch / "c.sock", scratch / "runs"
         if len(str(sock)) > MAX_SOCKET_PATH:
             raise RuntimeError(f"socket path too long ({len(str(sock))}): {sock}")
-        argv = [str(a) for a in self.coordinator_argv(run_id, slots, runs_dir, sock)]
+        argv = [str(a) for a in (*self.coordinator_argv(run_id, slots, runs_dir, sock), *extra)]
         files = [open(self.dir / f"coordinator-{tag}.{s}", "w") for s in ("stdout", "stderr")]
         proc = subprocess.Popen(argv, stdout=files[0], stderr=files[1], env=clean_env())
         register({"kind": "coordinator", "pid": proc.pid, "needle": str(sock), "scratch": str(scratch),
@@ -741,6 +742,7 @@ FEATURES = {
     "failed-tool": lambda c: failed_tool.journey(c, sys.modules[__name__]),
     "lifecycle": lambda c: lifecycle.journey(c, sys.modules[__name__]),
     "launcher": lambda c: launcher.journey(c, sys.modules[__name__]),
+    "leases": lambda c: leases.journey(c, sys.modules[__name__]),
 }
 
 

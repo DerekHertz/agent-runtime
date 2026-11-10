@@ -10,7 +10,9 @@ use std::path::Path;
 
 use clock::{Clock, Order};
 
-use crate::{read_events, read_payload, Access, Body, Event, Outcome, ShapeError, TRACE_FILE};
+use crate::{
+    read_events, read_payload, Access, Body, Event, EventKind, Outcome, ShapeError, TRACE_FILE,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
@@ -42,6 +44,8 @@ pub struct RunEvent {
     pub clock: Clock,
     /// The file this event writes, when it is a write (see [`Run::writes`]).
     pub write_path: Option<String>,
+    /// The reason the agent was given, when this event is a Deny.
+    pub deny_reason: Option<String>,
 }
 
 /// Two writes to one path by different slots, neither of which happens-before the other.
@@ -66,7 +70,7 @@ impl Run {
         let rows = read_events(&run_dir.join(TRACE_FILE))?;
         let mut inputs = HashMap::new();
         for row in &rows {
-            if needs_input(row)? {
+            if needs_payload(row)? {
                 if let Some(bytes) = read_payload(run_dir, row)? {
                     inputs.insert(row.event_id, bytes);
                 }
@@ -75,12 +79,12 @@ impl Run {
         Run::from_events(rows, |event| inputs.remove(&event.event_id))
     }
 
-    /// Build a run from rows already in memory. `input_of` returns the raw tool input of a
-    /// BeforeTool, and is asked only for a write tool's row that has no recorded path (a trace
-    /// written before the coordinator classified calls).
+    /// Build a run from rows already in memory. `payload_of` returns a row's payload, and is asked
+    /// only for a Deny (its reason) and for a write tool's BeforeTool that has no recorded path
+    /// (its raw tool input, in a trace written before the coordinator classified calls).
     pub fn from_events(
         rows: Vec<Event>,
-        mut input_of: impl FnMut(&Event) -> Option<Vec<u8>>,
+        mut payload_of: impl FnMut(&Event) -> Option<Vec<u8>>,
     ) -> Result<Run, RunError> {
         let failed = failed_calls(&rows)?;
         let mut run = Run::default();
@@ -95,11 +99,16 @@ impl Run {
                 {
                     match path {
                         Some(path) => Some(path.to_owned()),
-                        None => input_of(&event).and_then(|input| {
+                        None => payload_of(&event).and_then(|input| {
                             Access::classify(tool, &input).path().map(str::to_owned)
                         }),
                     }
                 }
+                _ => None,
+            };
+            let deny_reason = match event.body()? {
+                Body::Deny { .. } => payload_of(&event)
+                    .and_then(|reason| serde_json::from_slice::<String>(&reason).ok()),
                 _ => None,
             };
             if run.index.insert(event.event_id, run.events.len()).is_some() {
@@ -109,6 +118,7 @@ impl Run {
                 event,
                 clock,
                 write_path,
+                deny_reason,
             });
         }
         Ok(run)
@@ -173,6 +183,13 @@ impl Run {
         self.events.iter().filter(|e| e.write_path.is_some())
     }
 
+    /// The run's Denies: each write refused because another slot held the file's lease.
+    pub fn denies(&self) -> impl Iterator<Item = &RunEvent> {
+        self.events
+            .iter()
+            .filter(|e| e.event.kind == EventKind::Deny)
+    }
+
     /// Every pair of concurrent writes to one path by two slots, ordered by path, then by the
     /// pair's event ids. The coherence layer exists to make this list empty.
     pub fn concurrent_writes(&self) -> Vec<ConcurrentWrites> {
@@ -203,13 +220,16 @@ fn concurrent(a: &RunEvent, b: &RunEvent) -> bool {
     matches!(a.clock.compare(&b.clock), Order::Concurrent | Order::Equal)
 }
 
-/// Whether `event` is a write tool's BeforeTool with no recorded path, whose stored input must
-/// be read to find the file.
-fn needs_input(event: &Event) -> Result<bool, ShapeError> {
-    Ok(matches!(
-        event.body()?,
-        Body::BeforeTool { tool, path: None, .. } if Access::is_write_tool(tool)
-    ))
+/// Whether loading needs `event`'s payload: a Deny's reason, or the stored input of a write
+/// tool's BeforeTool with no recorded path.
+fn needs_payload(event: &Event) -> Result<bool, ShapeError> {
+    Ok(match event.body()? {
+        Body::Deny { .. } => true,
+        Body::BeforeTool {
+            tool, path: None, ..
+        } => Access::is_write_tool(tool),
+        _ => false,
+    })
 }
 
 /// The BeforeTool ids of the calls whose completion (their first AfterTool) is a failure.

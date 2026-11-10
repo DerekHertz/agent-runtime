@@ -20,13 +20,14 @@ pub struct Coordinator {
 
 impl Coordinator {
     /// Start `program` for run `run_id` under `runs_dir` and wait until its socket accepts a
-    /// connection. Its stderr goes to `log`.
+    /// connection. With `leases`, writes take leases. Its stderr goes to `log`.
     pub fn start(
         program: &Path,
         runs_dir: &Path,
         run_id: &str,
         slots: &[&str],
         socket: PathBuf,
+        leases: bool,
         log: &Path,
     ) -> Result<Coordinator> {
         let log_file = std::fs::File::create(log)
@@ -37,6 +38,7 @@ impl Coordinator {
             .arg(runs_dir)
             .arg("--socket")
             .arg(&socket)
+            .args(leases.then_some("--leases"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(log_file)

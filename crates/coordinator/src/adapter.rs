@@ -36,6 +36,8 @@ pub struct ServeConfig {
     /// Where the shims connect.
     pub socket: PathBuf,
     pub slots: Vec<String>,
+    /// Whether writes take leases.
+    pub leases: bool,
 }
 
 /// The coordinator's mutable half: the core's state and the trace it is recorded in.
@@ -288,6 +290,7 @@ impl std::fmt::Debug for Listening {
 pub fn bind(config: ServeConfig) -> anyhow::Result<Listening> {
     let run = RunConfig {
         slots: config.slots,
+        leases: config.leases,
     };
     run.validate()?;
     if let Some(parent) = config.socket.parent() {
@@ -382,6 +385,7 @@ mod tests {
     fn service(dir: &Path, slots: &[&str]) -> CoordinatorService {
         let config = RunConfig {
             slots: slots.iter().map(|s| s.to_string()).collect(),
+            leases: false,
         };
         CoordinatorService::new(&config, TraceWriter::create(dir).unwrap()).unwrap()
     }
@@ -609,6 +613,7 @@ mod tests {
             run_dir: dir.join(run),
             socket: dir.join("c.sock"),
             slots: vec!["slot-1".into()],
+            leases: false,
         }
     }
 
@@ -713,6 +718,7 @@ mod tests {
             run_dir: tmp.path().join("run"),
             socket,
             slots: vec!["slot-1".into()],
+            leases: false,
         });
         assert!(result.is_err());
     }
