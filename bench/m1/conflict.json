@@ -5,7 +5,7 @@
   "slots": [
     {
       "slot": "slot-1",
-      "prompt": "The test mean_works fails. Fix the bug in fn mean in src/lib.rs, then run cargo test."
+      "prompt": "Work in src/lib.rs, one step at a time, and run cargo test after each step. Step 1: the test mean_works fails; fix the bug in fn mean. Step 2: add a unit test mean_of_one that checks mean(&[5]) is Some(5.0). Step 3: add a unit test mean_of_negatives that checks mean(&[-2, 2]) is Some(0.0)."
     },
     {
       "slot": "slot-2",
